@@ -1,0 +1,1924 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="/opt/polmira"
+PHONES_DIR="$APP_DIR/phones"
+SCRIPTS_DIR="$APP_DIR/scripts"
+LOGS_DIR="$APP_DIR/logs"
+VPN_DIR="$APP_DIR/vpn"
+APPS_DIR="$APP_DIR/apps"
+BACKUP_DIR="$APP_DIR/backup"
+CONFIG_FILE="$APP_DIR/config.env"
+
+SELF_PATH="/usr/local/bin/polmira"
+
+NGINX_SITE="/etc/nginx/sites-available/polmira"
+NGINX_SITE_LINK="/etc/nginx/sites-enabled/polmira"
+NGINX_SNIPPETS_DIR="/etc/nginx/polmira"
+
+ADB_RANGE_START=5555
+ADB_RANGE_END=5599
+VNC_RANGE_START=5900
+VNC_RANGE_END=5999
+WEB_RANGE_START=6080
+WEB_RANGE_END=6199
+
+SCRCPY_VERSION="3.3.4"
+SING_BOX_IMAGE="ghcr.io/sagernet/sing-box:latest"
+REDROID_IMAGE="redroid/redroid:11.0.0-latest"
+
+DOCKER_NETWORK="polmira-net"
+VPN_PROXY_HOST="${VPN_PROXY_HOST:-172.17.0.1}"
+VPN_PROXY_PORT="${VPN_PROXY_PORT:-1080}"
+
+PUBLIC_HOST=""
+USE_HTTPS="no"
+SSL_CERT=""
+SSL_KEY=""
+
+SELECTED_PHONE_DIR=""
+SELECTED_PHONE_NAME=""
+SELECTED_FILE=""
+SELECTED_BACKUP_DIR=""
+
+NORMAL='\033[0m'
+GREEN='\033[32m'
+YELLOW='\033[33m'
+RED='\033[31m'
+
+say_green() { echo -e "${GREEN}$1${NORMAL}"; }
+say_yellow() { echo -e "${YELLOW}$1${NORMAL}"; }
+say_red() { echo -e "${RED}$1${NORMAL}"; }
+
+pause() {
+    echo
+    read -rp "Нажми Enter..." _ || true
+}
+
+section() {
+    echo
+    echo "======================================"
+    echo "$1"
+    echo "======================================"
+}
+
+need_root() {
+    if [ "${EUID}" -ne 0 ]; then
+        say_red "Запусти через sudo"
+        exit 1
+    fi
+}
+
+exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+create_dirs() {
+    mkdir -p "$APP_DIR" "$PHONES_DIR" "$SCRIPTS_DIR" "$LOGS_DIR" "$VPN_DIR" "$APPS_DIR" "$BACKUP_DIR" "$NGINX_SNIPPETS_DIR"
+}
+
+load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+    fi
+
+    PUBLIC_HOST="${PUBLIC_HOST:-}"
+    USE_HTTPS="${USE_HTTPS:-no}"
+    SSL_CERT="${SSL_CERT:-}"
+    SSL_KEY="${SSL_KEY:-}"
+}
+
+save_config() {
+    cat > "$CONFIG_FILE" <<EOF
+PUBLIC_HOST=${PUBLIC_HOST}
+USE_HTTPS=${USE_HTTPS}
+SSL_CERT=${SSL_CERT}
+SSL_KEY=${SSL_KEY}
+EOF
+    chmod 600 "$CONFIG_FILE" || true
+}
+
+install_self() {
+    local current
+    current="$(readlink -f "$0")"
+
+    if [ "$current" != "$SELF_PATH" ]; then
+        cp "$current" "$SELF_PATH"
+        chmod +x "$SELF_PATH"
+        say_green "Команда установлена: $SELF_PATH"
+    else
+        chmod +x "$SELF_PATH"
+    fi
+}
+
+find_package() {
+    local pkg
+
+    for pkg in "$@"; do
+        if apt-cache show "$pkg" >/dev/null 2>&1; then
+            echo "$pkg"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+fix_phone_permissions() {
+    local phone_dir="${1:-}"
+
+    chmod 755 /opt 2>/dev/null || true
+    chmod 755 "$APP_DIR" 2>/dev/null || true
+    chmod 755 "$PHONES_DIR" 2>/dev/null || true
+    chmod 755 "$APPS_DIR" 2>/dev/null || true
+    chmod 755 "$BACKUP_DIR" 2>/dev/null || true
+    chmod 755 "$NGINX_SNIPPETS_DIR" 2>/dev/null || true
+
+    if [ -n "$phone_dir" ] && [ -d "$phone_dir" ]; then
+        chmod 755 "$phone_dir" 2>/dev/null || true
+        chmod 755 "$phone_dir/scripts" 2>/dev/null || true
+        chmod 755 "$phone_dir/logs" 2>/dev/null || true
+
+        if [ -d "$phone_dir/data" ]; then
+            chmod 755 "$phone_dir/data" 2>/dev/null || true
+        fi
+
+        if [ -f "$phone_dir/htpasswd" ]; then
+            chmod 644 "$phone_dir/htpasswd" 2>/dev/null || true
+
+            if getent group www-data >/dev/null 2>&1; then
+                chown root:www-data "$phone_dir/htpasswd" 2>/dev/null || true
+            else
+                chown root:root "$phone_dir/htpasswd" 2>/dev/null || true
+            fi
+        fi
+    fi
+}
+
+fix_all_phone_permissions() {
+    local phone_dir
+    create_dirs
+
+    for phone_dir in "$PHONES_DIR"/*; do
+        [ -d "$phone_dir" ] || continue
+        fix_phone_permissions "$phone_dir"
+    done
+}
+
+preflight() {
+    section "Проверка системы"
+
+    if ! exists apt; then
+        say_red "Поддерживаются только Debian/Ubuntu"
+        exit 1
+    fi
+
+    if [ ! -e /dev/kvm ]; then
+        say_red "Нет /dev/kvm"
+        echo "Попроси провайдера включить nested virtualization / KVM."
+        exit 1
+    fi
+
+    if ! grep -E '(vmx|svm)' /proc/cpuinfo >/dev/null; then
+        say_red "Нет CPU flags vmx/svm"
+        echo "Провайдер не пробросил nested virtualization."
+        exit 1
+    fi
+
+    local ram_mb disk_free
+    ram_mb=$(free -m | awk '/Mem:/ {print $2}')
+    disk_free=$(df -BG / | awk 'NR==2 {gsub("G","",$4); print $4}')
+
+    echo "KVM: OK"
+    echo "CPU vmx/svm: OK"
+    echo "RAM: ${ram_mb} MB"
+    echo "DISK FREE: ${disk_free} GB"
+
+    if [ "$ram_mb" -lt 3500 ]; then
+        say_yellow "RAM меньше 4 GB. redroid может работать плохо."
+    fi
+
+    if [ "$disk_free" -lt 15 ]; then
+        say_red "Мало места. Нужно минимум 15 GB."
+        exit 1
+    fi
+}
+
+install_deps() {
+    section "Обновление пакетов"
+    apt update
+
+    section "Установка зависимостей"
+
+    apt install -y \
+        curl wget git python3 python3-pip python3-venv adb xvfb x11vnc novnc websockify \
+        netcat-openbsd ffmpeg libsdl2-2.0-0 tar unzip openssl nginx certbot apache2-utils \
+        psmisc iproute2 ca-certificates rsync
+
+    if ! exists docker; then
+        local docker_pkg
+        docker_pkg=$(find_package docker.io docker-ce || true)
+
+        if [ -z "$docker_pkg" ]; then
+            say_red "Docker пакет не найден в apt"
+            exit 1
+        fi
+
+        apt install -y "$docker_pkg"
+    fi
+
+    systemctl enable docker >/dev/null 2>&1 || true
+    systemctl start docker
+
+    if ! docker compose version >/dev/null 2>&1 && ! exists docker-compose; then
+        local compose_pkg
+        compose_pkg=$(find_package docker-compose-plugin docker-compose-v2 docker-compose || true)
+
+        if [ -n "$compose_pkg" ]; then
+            apt install -y "$compose_pkg"
+        else
+            say_red "Docker Compose не найден в apt"
+            exit 1
+        fi
+    fi
+}
+
+install_scrcpy() {
+    section "Установка scrcpy"
+
+    local tmp_dir arch scrcpy_url
+    tmp_dir="/tmp/polmira-scrcpy"
+    rm -rf "$tmp_dir"
+    mkdir -p "$tmp_dir"
+    cd "$tmp_dir"
+
+    arch="$(uname -m)"
+
+    if [ "$arch" = "x86_64" ]; then
+        scrcpy_url="https://github.com/Genymobile/scrcpy/releases/download/v${SCRCPY_VERSION}/scrcpy-linux-x86_64-v${SCRCPY_VERSION}.tar.gz"
+
+        if wget -O scrcpy.tar.gz "$scrcpy_url"; then
+            tar -xzf scrcpy.tar.gz
+            rm -rf /opt/scrcpy
+            mv "scrcpy-linux-x86_64-v${SCRCPY_VERSION}" /opt/scrcpy
+            ln -sf /opt/scrcpy/scrcpy /usr/local/bin/scrcpy
+        else
+            say_yellow "Не удалось скачать scrcpy ${SCRCPY_VERSION}, ставлю scrcpy из apt"
+            apt install -y scrcpy
+        fi
+    else
+        say_yellow "Архитектура не x86_64, ставлю scrcpy из apt"
+        apt install -y scrcpy
+    fi
+
+    if ! exists scrcpy; then
+        say_red "scrcpy не установлен"
+        exit 1
+    fi
+
+    scrcpy --version || true
+}
+
+install_binderfs_add() {
+    cat > "$SCRIPTS_DIR/binderfs-add" <<'PYEOF'
+#!/usr/bin/env python3
+import fcntl
+import struct
+import sys
+
+BINDERFS_MAX_NAME = 255
+BINDER_CTL_ADD = 0xC1086201
+
+if len(sys.argv) != 2:
+    print("usage: binderfs-add <name>")
+    sys.exit(1)
+
+name = sys.argv[1].encode("utf-8")
+
+if len(name) > BINDERFS_MAX_NAME:
+    print("name too long")
+    sys.exit(1)
+
+buf = bytearray(struct.pack("256sII", name, 0, 0))
+
+with open("/dev/binderfs/binder-control", "rb") as f:
+    fcntl.ioctl(f, BINDER_CTL_ADD, buf, True)
+
+raw_name, major, minor = struct.unpack("256sII", buf)
+print(f"created {sys.argv[1]} major={major} minor={minor}")
+PYEOF
+
+    chmod +x "$SCRIPTS_DIR/binderfs-add"
+    ln -sf "$SCRIPTS_DIR/binderfs-add" /usr/local/bin/binderfs-add
+}
+
+setup_binderfs_now() {
+    modprobe binder_linux || true
+    mkdir -p /dev/binderfs
+
+    if ! mountpoint -q /dev/binderfs; then
+        mount -t binder binder /dev/binderfs
+    fi
+
+    [ -e /dev/binderfs/binder ] || binderfs-add binder
+    [ -e /dev/binderfs/hwbinder ] || binderfs-add hwbinder
+    [ -e /dev/binderfs/vndbinder ] || binderfs-add vndbinder
+
+    chmod 666 /dev/binderfs/binder /dev/binderfs/hwbinder /dev/binderfs/vndbinder
+}
+
+install_binderfs_service() {
+    cat > /etc/systemd/system/polmira-binderfs.service <<'EOF'
+[Unit]
+Description=Polmira BinderFS
+DefaultDependencies=no
+After=local-fs.target
+Before=docker.service docker.socket containerd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/sbin/modprobe binder_linux
+ExecStartPre=/bin/mkdir -p /dev/binderfs
+ExecStartPre=/bin/sh -c '/bin/mountpoint -q /dev/binderfs || /bin/mount -t binder binder /dev/binderfs'
+ExecStartPre=/bin/sh -c '[ -e /dev/binderfs/binder ] || /usr/local/bin/binderfs-add binder'
+ExecStartPre=/bin/sh -c '[ -e /dev/binderfs/hwbinder ] || /usr/local/bin/binderfs-add hwbinder'
+ExecStartPre=/bin/sh -c '[ -e /dev/binderfs/vndbinder ] || /usr/local/bin/binderfs-add vndbinder'
+ExecStartPre=/bin/chmod 666 /dev/binderfs/binder /dev/binderfs/hwbinder /dev/binderfs/vndbinder
+ExecStart=/bin/true
+
+[Install]
+WantedBy=sysinit.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable polmira-binderfs.service >/dev/null 2>&1
+}
+
+compose_cmd() {
+    if docker compose version >/dev/null 2>&1; then
+        echo "docker compose"
+    elif exists docker-compose; then
+        echo "docker-compose"
+    else
+        say_red "Docker Compose не найден"
+        exit 1
+    fi
+}
+
+ask_nginx_config() {
+    load_config
+
+    section "Настройка домена/IP"
+
+    if [ -z "${PUBLIC_HOST:-}" ]; then
+        read -rp "Домен или IP для ссылок: " PUBLIC_HOST
+    else
+        echo "Текущий домен/IP: $PUBLIC_HOST"
+        read -rp "Оставить? [Y/n]: " keep_host
+
+        if [[ "$keep_host" =~ ^[Nn]$ ]]; then
+            read -rp "Новый домен или IP: " PUBLIC_HOST
+        fi
+    fi
+
+    if [ -z "$PUBLIC_HOST" ]; then
+        say_red "Домен/IP не может быть пустым"
+        exit 1
+    fi
+
+    echo
+    echo "HTTPS нужен только если есть домен и сертификат."
+    echo "Для IP обычно выбирай no."
+    read -rp "Использовать HTTPS? [y/N]: " https_answer
+
+    if [[ "$https_answer" =~ ^[Yy]$ ]]; then
+        USE_HTTPS="yes"
+
+        local default_cert default_key
+        default_cert="/etc/letsencrypt/live/${PUBLIC_HOST}/fullchain.pem"
+        default_key="/etc/letsencrypt/live/${PUBLIC_HOST}/privkey.pem"
+
+        if [ -f "$default_cert" ] && [ -f "$default_key" ]; then
+            SSL_CERT="$default_cert"
+            SSL_KEY="$default_key"
+        else
+            read -rp "Путь к fullchain.pem: " SSL_CERT
+            read -rp "Путь к privkey.pem: " SSL_KEY
+        fi
+
+        if [ ! -f "$SSL_CERT" ] || [ ! -f "$SSL_KEY" ]; then
+            say_red "Сертификат или ключ не найден"
+            exit 1
+        fi
+    else
+        USE_HTTPS="no"
+        SSL_CERT=""
+        SSL_KEY=""
+    fi
+
+    save_config
+}
+
+write_nginx_main_config() {
+    load_config
+    mkdir -p "$NGINX_SNIPPETS_DIR"
+
+    if [ "${USE_HTTPS:-no}" = "yes" ]; then
+        cat > "$NGINX_SITE" <<EOF
+map \$http_upgrade \$polmira_connection_upgrade {
+    default upgrade;
+    '' close;
+}
+
+server {
+    listen 80;
+    server_name ${PUBLIC_HOST};
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name ${PUBLIC_HOST};
+
+    ssl_certificate ${SSL_CERT};
+    ssl_certificate_key ${SSL_KEY};
+
+    client_max_body_size 2G;
+
+    location / {
+        return 404;
+    }
+
+    include ${NGINX_SNIPPETS_DIR}/*.conf;
+}
+EOF
+    else
+        cat > "$NGINX_SITE" <<EOF
+map \$http_upgrade \$polmira_connection_upgrade {
+    default upgrade;
+    '' close;
+}
+
+server {
+    listen 80;
+    server_name ${PUBLIC_HOST};
+
+    client_max_body_size 2G;
+
+    location / {
+        return 404;
+    }
+
+    include ${NGINX_SNIPPETS_DIR}/*.conf;
+}
+EOF
+    fi
+
+    ln -sf "$NGINX_SITE" "$NGINX_SITE_LINK"
+    fix_all_phone_permissions
+    nginx -t
+    systemctl reload nginx
+}
+
+public_base_url() {
+    load_config
+
+    if [ "${USE_HTTPS:-no}" = "yes" ]; then
+        echo "https://${PUBLIC_HOST}"
+    else
+        echo "http://${PUBLIC_HOST}"
+    fi
+}
+
+novnc_url() {
+    local web_path="$1"
+    local base_url
+
+    base_url=$(public_base_url)
+    echo "${base_url}${web_path}"
+}
+
+generate_web_path() {
+    openssl rand -hex 8 | awk '{print "/polmira/"$1"/"}'
+}
+
+set_phone_password_files() {
+    local phone_dir="$1"
+    local username="$2"
+    local password="$3"
+    local hash
+
+    hash=$(openssl passwd -apr1 "$password")
+    printf "%s:%s\n" "$username" "$hash" > "${phone_dir}/htpasswd"
+
+    fix_phone_permissions "$phone_dir"
+}
+
+write_phone_nginx_conf() {
+    local phone_name="$1"
+    local phone_dir="$2"
+
+    source "${phone_dir}/phone.env"
+
+    cat > "${phone_dir}/nginx.conf" <<EOF
+location = ${WEB_PATH} {
+    return 302 ${WEB_PATH}vnc.html?autoconnect=1&resize=scale&path=${WEB_PATH#/}websockify;
+}
+
+location ${WEB_PATH} {
+    auth_basic "Polmira ${phone_name}";
+    auth_basic_user_file ${phone_dir}/htpasswd;
+
+    proxy_pass http://127.0.0.1:${WEB_PORT}/;
+
+    proxy_http_version 1.1;
+
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection \$polmira_connection_upgrade;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+
+    proxy_read_timeout 86400;
+    proxy_send_timeout 86400;
+}
+EOF
+
+    ln -sf "${phone_dir}/nginx.conf" "${NGINX_SNIPPETS_DIR}/${phone_name}.conf"
+
+    fix_phone_permissions "$phone_dir"
+    nginx -t
+    systemctl reload nginx
+}
+
+remove_phone_nginx_conf() {
+    local phone_name="$1"
+
+    rm -f "${NGINX_SNIPPETS_DIR}/${phone_name}.conf"
+
+    if exists nginx; then
+        nginx -t && systemctl reload nginx
+    fi
+}
+
+find_free_port() {
+    local start="$1"
+    local end="$2"
+    local port used
+
+    for port in $(seq "$start" "$end"); do
+        used="no"
+
+        while IFS= read -r env_file; do
+            grep -Eq "^(ADB_PORT|VNC_PORT|WEB_PORT)=${port}$" "$env_file" && used="yes"
+        done < <(find "$PHONES_DIR" -mindepth 2 -maxdepth 2 -name phone.env 2>/dev/null)
+
+        if [ "$used" = "no" ]; then
+            echo "$port"
+            return 0
+        fi
+    done
+
+    return 1
+}
+find_free_display() {
+    local display used
+
+    for display in $(seq 1 99); do
+        used="no"
+
+        while IFS= read -r env_file; do
+            grep -Eq "^DISPLAY_NUM=${display}$" "$env_file" && used="yes"
+        done < <(find "$PHONES_DIR" -mindepth 2 -maxdepth 2 -name phone.env 2>/dev/null)
+
+        if [ "$used" = "no" ]; then
+            echo "$display"
+            return 0
+        fi
+    done
+
+    return 1
+}
+phone_env_set() {
+    local phone_dir="$1"
+    local key="$2"
+    local value="$3"
+
+    touch "$phone_dir/phone.env"
+    sed -i "/^${key}=/d" "$phone_dir/phone.env"
+    echo "${key}=${value}" >> "$phone_dir/phone.env"
+}
+
+ensure_docker_network() {
+    if exists docker; then
+        docker network inspect "$DOCKER_NETWORK" >/dev/null 2>&1 || docker network create "$DOCKER_NETWORK" >/dev/null
+    fi
+}
+
+vpn_is_configured() {
+    [ -f "$VPN_DIR/config.json" ]
+}
+
+configure_vpn() {
+    need_root
+    create_dirs
+
+    section "Настройка общего VPN"
+
+    echo "Тип: VLESS Reality через sing-box TUN"
+    echo
+
+    local address port uuid public_key short_id server_name fingerprint flow
+
+    read -rp "Server/IP: " address
+    read -rp "Port: " port
+    read -rp "UUID: " uuid
+    read -rp "Reality public key: " public_key
+    read -rp "Short ID: " short_id
+    read -rp "SNI/serverName: " server_name
+    read -rp "Fingerprint [chrome]: " fingerprint
+    read -rp "Flow [xtls-rprx-vision или пусто]: " flow
+
+    fingerprint="${fingerprint:-chrome}"
+
+    if [ -z "$address" ] || [ -z "$port" ] || [ -z "$uuid" ] || [ -z "$public_key" ] || [ -z "$server_name" ]; then
+        say_red "Поля server/port/uuid/public key/sni обязательны"
+        return
+    fi
+
+    cat > "$VPN_DIR/config.json" <<EOF
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "google",
+        "type": "udp",
+        "server": "8.8.8.8"
+      }
+    ],
+    "strategy": "ipv4_only",
+    "final": "google"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "singtun0",
+      "address": [
+        "172.19.0.1/30"
+      ],
+      "mtu": 1400,
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "system",
+      "route_exclude_address": [
+        "${address}/32",
+        "127.0.0.0/8",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16"
+      ]
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "proxy",
+      "server": "${address}",
+      "server_port": ${port},
+      "uuid": "${uuid}",
+      "flow": "${flow}",
+      "tls": {
+        "enabled": true,
+        "server_name": "${server_name}",
+        "reality": {
+          "enabled": true,
+          "public_key": "${public_key}",
+          "short_id": "${short_id}"
+        },
+        "utls": {
+          "enabled": true,
+          "fingerprint": "${fingerprint}"
+        }
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "default_domain_resolver": {
+      "server": "google"
+    },
+    "rules": [
+      {
+        "action": "sniff"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "ip_cidr": [
+          "${address}/32",
+          "127.0.0.0/8",
+          "10.0.0.0/8",
+          "172.16.0.0/12",
+          "192.168.0.0/16"
+        ],
+        "outbound": "direct"
+      }
+    ],
+    "final": "proxy"
+  }
+}
+EOF
+
+    chmod 600 "$VPN_DIR/config.json"
+
+    if python3 -m json.tool "$VPN_DIR/config.json" >/dev/null; then
+        say_green "VPN config сохранён: $VPN_DIR/config.json"
+    else
+        say_red "JSON получился битый. Конфиг невалиден."
+        return
+    fi
+}
+
+write_compose() {
+    local phone_dir="$1"
+
+    source "$phone_dir/phone.env"
+
+    cat > "$phone_dir/docker-compose.yml" <<EOF
+services:
+  "${PHONE_NAME}":
+    image: ${REDROID_IMAGE}
+    container_name: polmira-${PHONE_NAME}
+    privileged: true
+    ports:
+      - "${ADB_PORT}:5555"
+    volumes:
+      - ${phone_dir}/data:/data
+      - /dev/binderfs:/dev/binderfs
+      - /dev/kvm:/dev/kvm
+    devices:
+      - /dev/kvm:/dev/kvm
+    networks:
+      - polmira-net
+    command:
+      - androidboot.redroid_gpu_mode=guest
+      - androidboot.use_memfd=1
+      - androidboot.hardware=redroid
+    restart: unless-stopped
+
+networks:
+  polmira-net:
+    external: true
+EOF
+}
+wait_android_script() {
+    local phone_dir="$1"
+
+    cat > "$phone_dir/scripts/wait-ready.sh" <<'EOF'
+#!/usr/bin/env bash
+set -e
+
+cd "$(dirname "$0")/.."
+source ./phone.env
+
+ADB_TARGET="127.0.0.1:${ADB_PORT}"
+
+echo "Ожидание ADB ${ADB_PORT}..."
+
+until nc -z 127.0.0.1 "$ADB_PORT"; do
+    sleep 1
+done
+
+adb disconnect "$ADB_TARGET" >/dev/null 2>&1 || true
+adb connect "$ADB_TARGET" >/dev/null 2>&1 || true
+
+echo "Ожидание Android..."
+
+count=0
+
+while [ "$count" -lt 180 ]; do
+    BOOT=$(adb -s "$ADB_TARGET" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
+
+    if [ "$BOOT" = "1" ]; then
+        echo "Android готов"
+
+        VPN_ENABLED="${VPN_ENABLED:-no}"
+        VPN_PROXY_HOST="${VPN_PROXY_HOST:-172.17.0.1}"
+        VPN_PROXY_PORT="${VPN_PROXY_PORT:-1080}"
+
+        if [ "$VPN_ENABLED" = "yes" ]; then
+            echo "Применяю proxy ${VPN_PROXY_HOST}:${VPN_PROXY_PORT}"
+            adb -s "$ADB_TARGET" shell settings put global http_proxy "${VPN_PROXY_HOST}:${VPN_PROXY_PORT}" || true
+        fi
+
+        exit 0
+    fi
+
+    adb connect "$ADB_TARGET" >/dev/null 2>&1 || true
+    count=$((count + 1))
+    sleep 2
+done
+
+echo "Таймаут загрузки Android"
+exit 1
+EOF
+
+    chmod +x "$phone_dir/scripts/wait-ready.sh"
+}
+
+web_script() {
+    local phone_dir="$1"
+
+    cat > "$phone_dir/scripts/start-web.sh" <<'EOF'
+#!/usr/bin/env bash
+set -e
+
+cd "$(dirname "$0")/.."
+source ./phone.env
+
+ADB_TARGET="127.0.0.1:${ADB_PORT}"
+RES="1080x1920x24"
+RUN_DIR="./run"
+
+mkdir -p "$RUN_DIR" logs
+
+kill_pid_file() {
+    local file="$1"
+    local pid=""
+
+    [ -f "$file" ] || return 0
+    pid="$(cat "$file" 2>/dev/null || true)"
+
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        sleep 1
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+
+    rm -f "$file"
+}
+
+cleanup_own_processes() {
+    kill_pid_file "$RUN_DIR/websockify.pid"
+    kill_pid_file "$RUN_DIR/scrcpy.pid"
+    kill_pid_file "$RUN_DIR/x11vnc.pid"
+    kill_pid_file "$RUN_DIR/xvfb.pid"
+
+    rm -f "/tmp/.X${DISPLAY_NUM}-lock" "/tmp/.X11-unix/X${DISPLAY_NUM}" 2>/dev/null || true
+}
+
+trap cleanup_own_processes EXIT
+
+cleanup_own_processes
+
+Xvfb ":${DISPLAY_NUM}" -screen 0 "$RES" >logs/xvfb.log 2>&1 &
+echo $! > "$RUN_DIR/xvfb.pid"
+sleep 2
+
+x11vnc \
+    -display ":${DISPLAY_NUM}" \
+    -forever \
+    -shared \
+    -nopw \
+    -noxdamage \
+    -rfbport "$VNC_PORT" \
+    -listen 127.0.0.1 \
+    >logs/x11vnc.log 2>&1 &
+echo $! > "$RUN_DIR/x11vnc.pid"
+
+sleep 2
+
+SCRCPY_AUDIO_ARG=""
+
+if scrcpy --help 2>&1 | grep -q -- "--no-audio"; then
+    SCRCPY_AUDIO_ARG="--no-audio"
+fi
+
+adb connect "$ADB_TARGET" >/dev/null 2>&1 || true
+
+DISPLAY=":${DISPLAY_NUM}" scrcpy \
+    -s "$ADB_TARGET" \
+    $SCRCPY_AUDIO_ARG \
+    --window-title "Android-${PHONE_NAME}" \
+    --window-x 0 \
+    --window-y 0 \
+    --window-width 1080 \
+    --window-height 1920 \
+    --render-driver=software \
+    >logs/scrcpy.log 2>&1 &
+echo $! > "$RUN_DIR/scrcpy.pid"
+
+sleep 2
+
+websockify \
+    --web=/usr/share/novnc \
+    "$WEB_PORT" \
+    "127.0.0.1:${VNC_PORT}" \
+    >logs/websockify.log 2>&1 &
+echo $! > "$RUN_DIR/websockify.pid"
+
+wait
+EOF
+
+    chmod +x "$phone_dir/scripts/start-web.sh"
+}
+write_systemd_services() {
+    local phone_dir="$1"
+
+    source "$phone_dir/phone.env"
+
+    local cmd
+    cmd=$(compose_cmd)
+
+    cat > "/etc/systemd/system/polmira-phone-${PHONE_NAME}-init.service" <<EOF
+[Unit]
+Description=Polmira Phone ${PHONE_NAME} Init
+After=polmira-binderfs.service docker.service network-online.target
+Requires=polmira-binderfs.service docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=${phone_dir}
+ExecStart=${cmd} up -d
+ExecStart=${phone_dir}/scripts/wait-ready.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    cat > "/etc/systemd/system/polmira-phone-${PHONE_NAME}-web.service" <<EOF
+[Unit]
+Description=Polmira Phone ${PHONE_NAME} Web
+After=polmira-phone-${PHONE_NAME}-init.service
+Requires=polmira-phone-${PHONE_NAME}-init.service
+
+[Service]
+Type=simple
+WorkingDirectory=${phone_dir}
+ExecStart=${phone_dir}/scripts/start-web.sh
+Restart=always
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable "polmira-phone-${PHONE_NAME}-init.service" >/dev/null
+    systemctl enable "polmira-phone-${PHONE_NAME}-web.service" >/dev/null
+}
+
+restart_phone_services() {
+    local phone_name="$1"
+
+    systemctl restart "polmira-phone-${phone_name}-init.service"
+    systemctl restart "polmira-phone-${phone_name}-web.service"
+}
+
+stop_phone_services() {
+    local phone_name="$1"
+
+    systemctl stop "polmira-phone-${phone_name}-web.service" 2>/dev/null || true
+    systemctl stop "polmira-phone-${phone_name}-init.service" 2>/dev/null || true
+}
+
+compose_down_phone() {
+    local phone_dir="$1"
+
+    [ -d "$phone_dir" ] || return 0
+    cd "$phone_dir"
+
+    if docker compose version >/dev/null 2>&1; then
+        docker compose down || true
+    else
+        docker-compose down || true
+    fi
+}
+
+compose_stop_phone() {
+    local phone_dir="$1"
+
+    [ -d "$phone_dir" ] || return 0
+    cd "$phone_dir"
+
+    if docker compose version >/dev/null 2>&1; then
+        docker compose stop || true
+    else
+        docker-compose stop || true
+    fi
+}
+
+create_phone() {
+    need_root
+    create_dirs
+    load_config
+
+    section "Создание телефона"
+
+    if [ ! -f "$CONFIG_FILE" ]; then
+        say_red "Polmira не установлена. Сначала пункт 1."
+        return
+    fi
+
+    if [ ! -e /dev/kvm ]; then
+        say_red "Нет /dev/kvm"
+        return
+    fi
+
+    if [ ! -e /dev/binderfs/binder ] || [ ! -e /dev/binderfs/hwbinder ] || [ ! -e /dev/binderfs/vndbinder ]; then
+        setup_binderfs_now
+    fi
+
+    local phone_name phone_dir adb_port vnc_port web_port display_num web_path default_user default_pass phone_url
+
+    read -rp "Имя телефона латиницей/цифрами: " phone_name
+
+    if [[ ! "$phone_name" =~ ^[a-zA-Z0-9]+$ ]]; then
+        say_red "Только латиница и цифры"
+        return
+    fi
+
+    phone_dir="$PHONES_DIR/$phone_name"
+
+    if [ -d "$phone_dir" ]; then
+        say_red "Телефон уже существует"
+        return
+    fi
+
+    adb_port=$(find_free_port "$ADB_RANGE_START" "$ADB_RANGE_END")
+    vnc_port=$(find_free_port "$VNC_RANGE_START" "$VNC_RANGE_END")
+    web_port=$(find_free_port "$WEB_RANGE_START" "$WEB_RANGE_END")
+    display_num=$(find_free_display)
+    web_path=$(generate_web_path)
+
+    if [ -z "$adb_port" ] || [ -z "$vnc_port" ] || [ -z "$web_port" ] || [ -z "$display_num" ]; then
+        say_red "Не удалось подобрать свободные ресурсы"
+        return
+    fi
+
+    mkdir -p "$phone_dir/data" "$phone_dir/logs" "$phone_dir/scripts"
+
+    default_user="admin"
+    default_pass=$(openssl rand -hex 6)
+
+    cat > "$phone_dir/phone.env" <<EOF
+PHONE_NAME=${phone_name}
+ADB_PORT=${adb_port}
+VNC_PORT=${vnc_port}
+WEB_PORT=${web_port}
+DISPLAY_NUM=${display_num}
+DISPLAY=:${display_num}
+WEB_PATH=${web_path}
+USERNAME=${default_user}
+VPN_ENABLED=no
+EOF
+
+    set_phone_password_files "$phone_dir" "$default_user" "$default_pass"
+    ensure_docker_network
+    write_compose "$phone_dir"
+    wait_android_script "$phone_dir"
+    web_script "$phone_dir"
+    write_phone_nginx_conf "$phone_name" "$phone_dir"
+    write_systemd_services "$phone_dir"
+    fix_phone_permissions "$phone_dir"
+
+    echo
+    echo "Запускаю телефон. Первый запуск может занять несколько минут..."
+    restart_phone_services "$phone_name"
+
+    phone_url=$(novnc_url "$web_path")
+
+    say_green "Телефон создан"
+    echo
+    echo "Имя: $phone_name"
+    echo "Логин: $default_user"
+    echo "Пароль: $default_pass"
+    echo "VPN: OFF"
+    echo
+    echo "Ссылка:"
+    echo "$phone_url"
+}
+
+list_phones() {
+    create_dirs
+    load_config
+
+    section "Список телефонов"
+
+    local phone_list phone_dir phone_name init_status web_status phone_url i
+    mapfile -t phone_list < <(find "$PHONES_DIR" -mindepth 1 -maxdepth 1 -type d | sort)
+
+    if [ "${#phone_list[@]}" -eq 0 ]; then
+        echo "Телефонов нет"
+        return
+    fi
+
+    i=1
+
+    for phone_dir in "${phone_list[@]}"; do
+        phone_name=$(basename "$phone_dir")
+
+        if [ ! -f "$phone_dir/phone.env" ]; then
+            echo "[$i] $phone_name — нет phone.env"
+            i=$((i + 1))
+            continue
+        fi
+
+        source "$phone_dir/phone.env"
+        VPN_ENABLED="${VPN_ENABLED:-no}"
+
+        init_status=$(systemctl is-active "polmira-phone-${PHONE_NAME}-init.service" 2>/dev/null || true)
+        web_status=$(systemctl is-active "polmira-phone-${PHONE_NAME}-web.service" 2>/dev/null || true)
+        phone_url=$(novnc_url "$WEB_PATH")
+
+        echo "[$i] $PHONE_NAME"
+        echo "    URL: $phone_url"
+        echo "    ADB=$ADB_PORT VNC=$VNC_PORT WEB=$WEB_PORT DISPLAY=:$DISPLAY_NUM VPN=$VPN_ENABLED"
+        echo "    init=$init_status web=$web_status"
+
+        i=$((i + 1))
+    done
+}
+
+select_phone() {
+    local phone_list i num idx phone_dir
+
+    mapfile -t phone_list < <(find "$PHONES_DIR" -mindepth 1 -maxdepth 1 -type d | sort)
+
+    if [ "${#phone_list[@]}" -eq 0 ]; then
+        say_red "Телефонов нет"
+        return 1
+    fi
+
+    i=1
+
+    for phone_dir in "${phone_list[@]}"; do
+        echo "[$i] $(basename "$phone_dir")"
+        i=$((i + 1))
+    done
+
+    echo
+    read -rp "Номер: " num
+
+    if ! [[ "$num" =~ ^[0-9]+$ ]]; then
+        say_red "Неверный номер"
+        return 1
+    fi
+
+    idx=$((num - 1))
+
+    if [ "$idx" -lt 0 ] || [ "$idx" -ge "${#phone_list[@]}" ]; then
+        say_red "Нет такого номера"
+        return 1
+    fi
+
+    SELECTED_PHONE_DIR="${phone_list[$idx]}"
+    SELECTED_PHONE_NAME=$(basename "$SELECTED_PHONE_DIR")
+}
+
+start_restart_phone() {
+    need_root
+    section "Включить / перезагрузить телефон"
+
+    select_phone || return
+    fix_phone_permissions "$SELECTED_PHONE_DIR"
+    restart_phone_services "$SELECTED_PHONE_NAME"
+
+    say_green "Телефон включён/перезапущен: $SELECTED_PHONE_NAME"
+}
+
+stop_phone() {
+    need_root
+    section "Выключить телефон"
+
+    select_phone || return
+    stop_phone_services "$SELECTED_PHONE_NAME"
+    compose_stop_phone "$SELECTED_PHONE_DIR"
+
+    say_green "Телефон выключен: $SELECTED_PHONE_NAME"
+}
+
+delete_phone() {
+    need_root
+    section "Удаление телефона"
+
+    select_phone || return
+
+    local phone_dir phone_name ok
+    phone_dir="$SELECTED_PHONE_DIR"
+    phone_name="$SELECTED_PHONE_NAME"
+
+    if [ -f "$phone_dir/phone.env" ]; then
+        source "$phone_dir/phone.env"
+    fi
+
+    read -rp "Удалить $phone_name? [y/N]: " ok
+
+    if [[ ! "$ok" =~ ^[Yy]$ ]]; then
+        echo "Отмена"
+        return
+    fi
+
+    stop_phone_services "$phone_name"
+
+    systemctl disable "polmira-phone-${phone_name}-web.service" 2>/dev/null || true
+    systemctl disable "polmira-phone-${phone_name}-init.service" 2>/dev/null || true
+
+    rm -f "/etc/systemd/system/polmira-phone-${phone_name}-web.service"
+    rm -f "/etc/systemd/system/polmira-phone-${phone_name}-init.service"
+
+    systemctl daemon-reload
+    systemctl reset-failed
+
+    if [ -d "$phone_dir" ]; then
+        cd "$phone_dir"
+
+        if docker compose version >/dev/null 2>&1; then
+            docker compose down -v || true
+        else
+            docker-compose down -v || true
+        fi
+    fi
+
+    docker rm -f "polmira-${phone_name}" 2>/dev/null || true
+    docker rm -f "polmira-${phone_name}-vpn" 2>/dev/null || true
+
+    remove_phone_nginx_conf "$phone_name"
+    rm -rf "$phone_dir"
+
+    say_green "Телефон удален"
+}
+
+set_phone_password() {
+    need_root
+    section "Установить пароль"
+
+    select_phone || return
+
+    local phone_dir phone_name new_user new_pass
+    phone_dir="$SELECTED_PHONE_DIR"
+    phone_name="$SELECTED_PHONE_NAME"
+
+    read -rp "Username: " new_user
+    read -rsp "Password: " new_pass
+    echo
+
+    if [ -z "$new_user" ] || [ -z "$new_pass" ]; then
+        say_red "Username/password не могут быть пустыми"
+        return
+    fi
+
+    set_phone_password_files "$phone_dir" "$new_user" "$new_pass"
+
+    if [ -f "$phone_dir/phone.env" ]; then
+        sed -i "/^USERNAME=/d" "$phone_dir/phone.env"
+        echo "USERNAME=${new_user}" >> "$phone_dir/phone.env"
+    fi
+
+    nginx -t
+    systemctl reload nginx
+
+    say_green "Пароль обновлён для телефона: $phone_name"
+}
+
+recreate_phone_with_current_compose() {
+    local phone_dir="$1"
+    local phone_name="$2"
+
+    stop_phone_services "$phone_name"
+    compose_down_phone "$phone_dir"
+    docker rm -f "polmira-${phone_name}" 2>/dev/null || true
+    docker rm -f "polmira-${phone_name}-vpn" 2>/dev/null || true
+    write_compose "$phone_dir"
+    write_systemd_services "$phone_dir"
+    fix_phone_permissions "$phone_dir"
+    restart_phone_services "$phone_name"
+}
+
+apply_phone_proxy_by_dir() {
+    local phone_dir="$1"
+
+    source "$phone_dir/phone.env"
+
+    local adb_target
+    adb_target="127.0.0.1:${ADB_PORT}"
+
+    wait_phone_ready_by_dir "$phone_dir" || return 1
+
+    adb -s "$adb_target" shell settings put global http_proxy "${VPN_PROXY_HOST}:${VPN_PROXY_PORT}"
+    adb -s "$adb_target" shell settings put global global_http_proxy_host "$VPN_PROXY_HOST" || true
+    adb -s "$adb_target" shell settings put global global_http_proxy_port "$VPN_PROXY_PORT" || true
+}
+
+clear_phone_proxy_by_dir() {
+    local phone_dir="$1"
+
+    source "$phone_dir/phone.env"
+
+    local adb_target
+    adb_target="127.0.0.1:${ADB_PORT}"
+
+    wait_phone_ready_by_dir "$phone_dir" || return 1
+
+    adb -s "$adb_target" shell settings put global http_proxy :0 || true
+    adb -s "$adb_target" shell settings delete global http_proxy || true
+    adb -s "$adb_target" shell settings delete global global_http_proxy_host || true
+    adb -s "$adb_target" shell settings delete global global_http_proxy_port || true
+}
+
+enable_vpn_for_phone() {
+    need_root
+    section "Включить VPN для телефона"
+
+    select_phone || return
+
+    phone_env_set "$SELECTED_PHONE_DIR" "VPN_ENABLED" "yes"
+
+    say_yellow "Перезапускаю телефон..."
+    restart_phone_services "$SELECTED_PHONE_NAME"
+
+    wait_phone_ready_by_dir "$SELECTED_PHONE_DIR" || return
+
+    apply_phone_proxy_by_dir "$SELECTED_PHONE_DIR" || return
+
+    say_green "VPN/proxy включён для телефона: $SELECTED_PHONE_NAME"
+    echo "Proxy: ${VPN_PROXY_HOST}:${VPN_PROXY_PORT}"
+
+    check_phone_ip_by_dir "$SELECTED_PHONE_DIR" || true
+}
+disable_vpn_for_phone() {
+    need_root
+    section "Выключить VPN для телефона"
+
+    select_phone || return
+
+    phone_env_set "$SELECTED_PHONE_DIR" "VPN_ENABLED" "no"
+
+    say_yellow "Перезапускаю телефон..."
+    restart_phone_services "$SELECTED_PHONE_NAME"
+
+    wait_phone_ready_by_dir "$SELECTED_PHONE_DIR" || return
+
+    clear_phone_proxy_by_dir "$SELECTED_PHONE_DIR" || return
+
+    say_green "VPN/proxy выключен для телефона: $SELECTED_PHONE_NAME"
+
+    check_phone_ip_by_dir "$SELECTED_PHONE_DIR" || true
+}
+vpn_status() {
+    section "Статус VPN"
+
+    if vpn_is_configured; then
+        say_green "Глобальный VPN config: есть"
+        echo "$VPN_DIR/config.json"
+    else
+        say_yellow "Глобальный VPN config: не настроен"
+    fi
+
+    echo
+    list_phones
+}
+
+check_phone_ip_by_dir() {
+    local phone_dir="$1"
+
+    if [ ! -f "$phone_dir/phone.env" ]; then
+        say_red "Нет phone.env"
+        return 1
+    fi
+
+    source "$phone_dir/phone.env"
+
+    local adb_target ip
+    adb_target="127.0.0.1:${ADB_PORT}"
+
+    adb connect "$adb_target" >/dev/null 2>&1 || true
+
+    ip=$(adb -s "$adb_target" shell 'toybox wget -qO- https://api.ipify.org 2>/dev/null || curl -s https://api.ipify.org 2>/dev/null || echo FAIL' 2>/dev/null | tr -d '\r' || true)
+
+    echo "IP телефона ${PHONE_NAME}: ${ip:-FAIL}"
+}
+
+check_phone_ip() {
+    need_root
+    section "Проверить IP телефона"
+
+    select_phone || return
+    check_phone_ip_by_dir "$SELECTED_PHONE_DIR" || true
+}
+
+migrate_existing_phones() {
+    need_root
+    create_dirs
+
+    section "Миграция существующих телефонов"
+
+    local phone_dir phone_name changed
+
+    for phone_dir in "$PHONES_DIR"/*; do
+        [ -d "$phone_dir" ] || continue
+        [ -f "$phone_dir/phone.env" ] || continue
+
+        phone_name=$(basename "$phone_dir")
+        changed="no"
+
+        source "$phone_dir/phone.env"
+
+        if ! grep -q '^VPN_ENABLED=' "$phone_dir/phone.env"; then
+            echo "VPN_ENABLED=no" >> "$phone_dir/phone.env"
+            changed="yes"
+        fi
+
+        mkdir -p "$phone_dir/data" "$phone_dir/logs" "$phone_dir/scripts"
+        wait_android_script "$phone_dir"
+        web_script "$phone_dir"
+        write_compose "$phone_dir"
+        write_phone_nginx_conf "$phone_name" "$phone_dir"
+        write_systemd_services "$phone_dir"
+        fix_phone_permissions "$phone_dir"
+
+        if [ "$changed" = "yes" ]; then
+            echo "$phone_name: migrated"
+        else
+            echo "$phone_name: ok"
+        fi
+    done
+
+    say_green "Миграция завершена"
+}
+
+cleanup_broken_nginx_snippets() {
+    need_root
+    create_dirs
+
+    section "Очистка битых nginx snippets"
+
+    local snippet phone_name target removed
+    removed=0
+
+    for snippet in "$NGINX_SNIPPETS_DIR"/*.conf; do
+        [ -e "$snippet" ] || continue
+
+        phone_name=$(basename "$snippet" .conf)
+        target="$PHONES_DIR/$phone_name"
+
+        if [ ! -d "$target" ] || [ ! -f "$target/phone.env" ]; then
+            echo "Удаляю битый snippet: $snippet"
+            rm -f "$snippet"
+            removed=$((removed + 1))
+        fi
+    done
+
+    nginx -t
+    systemctl reload nginx
+
+    echo "Удалено: $removed"
+}
+
+wait_phone_ready_by_dir() {
+    local phone_dir="$1"
+
+    if [ ! -f "$phone_dir/phone.env" ]; then
+        say_red "Нет phone.env"
+        return 1
+    fi
+
+    source "$phone_dir/phone.env"
+
+    local adb_target boot count
+    adb_target="127.0.0.1:${ADB_PORT}"
+
+    echo "Ожидание телефона ${PHONE_NAME}..."
+
+    until nc -z 127.0.0.1 "$ADB_PORT"; do
+        sleep 1
+    done
+
+    adb disconnect "$adb_target" >/dev/null 2>&1 || true
+    adb connect "$adb_target" >/dev/null 2>&1 || true
+
+    count=0
+
+    while [ "$count" -lt 180 ]; do
+        boot=$(adb -s "$adb_target" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
+
+        if [ "$boot" = "1" ]; then
+            echo "Android готов"
+            return 0
+        fi
+
+        adb connect "$adb_target" >/dev/null 2>&1 || true
+        count=$((count + 1))
+        sleep 2
+    done
+
+    say_red "Таймаут загрузки Android"
+    return 1
+}
+
+select_app_file() {
+    local files i num idx
+
+    create_dirs
+
+    mapfile -t files < <(find "$APPS_DIR" -maxdepth 1 -type f \( -iname "*.apk" -o -iname "*.apkm" -o -iname "*.xapk" -o -iname "*.apks" \) | sort)
+
+    if [ "${#files[@]}" -eq 0 ]; then
+        say_red "Приложений нет."
+        echo "Положи APK в папку: $APPS_DIR"
+        return 1
+    fi
+
+    section "Выбор приложения"
+
+    i=1
+    for file in "${files[@]}"; do
+        echo "[$i] $(basename "$file")"
+        i=$((i + 1))
+    done
+
+    echo
+    read -rp "Номер: " num
+
+    if ! [[ "$num" =~ ^[0-9]+$ ]]; then
+        say_red "Неверный номер"
+        return 1
+    fi
+
+    idx=$((num - 1))
+
+    if [ "$idx" -lt 0 ] || [ "$idx" -ge "${#files[@]}" ]; then
+        say_red "Нет такого номера"
+        return 1
+    fi
+
+    SELECTED_FILE="${files[$idx]}"
+}
+
+install_app_to_phone() {
+    need_root
+    create_dirs
+
+    section "Установить приложение"
+
+    echo "Выбери телефон:"
+    select_phone || return
+
+    select_app_file || return
+
+    source "$SELECTED_PHONE_DIR/phone.env"
+
+    local adb_target ext tmp_dir install_ok remote_apk
+    adb_target="127.0.0.1:${ADB_PORT}"
+    ext="${SELECTED_FILE##*.}"
+    ext="${ext,,}"
+    install_ok="no"
+
+    wait_phone_ready_by_dir "$SELECTED_PHONE_DIR" || return
+
+    echo
+    echo "Телефон: $PHONE_NAME"
+    echo "Приложение: $(basename "$SELECTED_FILE")"
+    echo
+
+    case "$ext" in
+        apk)
+            remote_apk="/data/local/tmp/polmira-install.apk"
+
+            adb -s "$adb_target" push "$SELECTED_FILE" "$remote_apk"
+            adb -s "$adb_target" shell pm install -r -d -g "$remote_apk"
+            adb -s "$adb_target" shell rm -f "$remote_apk" || true
+
+            install_ok="yes"
+            ;;
+
+        apks|xapk|apkm|zip)
+            tmp_dir="/tmp/polmira-app-$(openssl rand -hex 4)"
+            mkdir -p "$tmp_dir"
+
+            unzip -q "$SELECTED_FILE" -d "$tmp_dir"
+
+            mapfile -t apk_parts < <(find "$tmp_dir" -type f -iname "*.apk" | sort)
+
+            if [ "${#apk_parts[@]}" -eq 0 ]; then
+                rm -rf "$tmp_dir"
+                say_red "В архиве нет APK файлов"
+                return 1
+            fi
+
+            echo "Найдено APK частей: ${#apk_parts[@]}"
+
+            adb -s "$adb_target" install-multiple -r -d -g "${apk_parts[@]}"
+            install_ok="yes"
+
+            rm -rf "$tmp_dir"
+            ;;
+
+        *)
+            say_red "Неподдерживаемый файл: $SELECTED_FILE"
+            return 1
+            ;;
+    esac
+
+    if [ "$install_ok" != "yes" ]; then
+        say_red "Установка не удалась"
+        return 1
+    fi
+
+    echo
+    echo "Обновляю launcher и web-экран..."
+
+    adb -s "$adb_target" shell cmd package compile -m speed-profile -f -a >/dev/null 2>&1 || true
+    adb -s "$adb_target" shell am force-stop com.android.launcher3 >/dev/null 2>&1 || true
+    adb -s "$adb_target" shell monkey -p com.android.launcher3 1 >/dev/null 2>&1 || true
+
+    systemctl restart "polmira-phone-${PHONE_NAME}-web.service" || true
+
+    say_green "Приложение установлено"
+}
+
+select_backup_folder() {
+    local folders i num idx
+
+    create_dirs
+
+    mapfile -t folders < <(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d | sort)
+
+    if [ "${#folders[@]}" -eq 0 ]; then
+        say_red "Папок backup нет."
+        echo "Положи папку с data в: $BACKUP_DIR"
+        return 1
+    fi
+
+    section "Выбор backup"
+
+    i=1
+    for folder in "${folders[@]}"; do
+        echo "[$i] $(basename "$folder")"
+        i=$((i + 1))
+    done
+
+    echo
+    read -rp "Номер: " num
+
+    if ! [[ "$num" =~ ^[0-9]+$ ]]; then
+        say_red "Неверный номер"
+        return 1
+    fi
+
+    idx=$((num - 1))
+
+    if [ "$idx" -lt 0 ] || [ "$idx" -ge "${#folders[@]}" ]; then
+        say_red "Нет такого номера"
+        return 1
+    fi
+
+    SELECTED_BACKUP_DIR="${folders[$idx]}"
+}
+
+clean_redroid_data_after_restore() {
+    local target_data="$1"
+
+    rm -rf "$target_data"/misc/bootstat/* 2>/dev/null || true
+    rm -rf "$target_data"/system/dropbox/* 2>/dev/null || true
+    rm -rf "$target_data"/system/usagestats/* 2>/dev/null || true
+    rm -rf "$target_data"/system/package_cache/* 2>/dev/null || true
+    rm -rf "$target_data"/dalvik-cache/* 2>/dev/null || true
+    rm -rf "$target_data"/resource-cache/* 2>/dev/null || true
+    rm -rf "$target_data"/local/tmp/* 2>/dev/null || true
+
+    find "$target_data" -type s -delete 2>/dev/null || true
+    find "$target_data" -name "*.lock" -delete 2>/dev/null || true
+}
+
+repair_redroid_data_permissions() {
+    local target_data="$1"
+
+    chmod 755 "$target_data" 2>/dev/null || true
+}
+
+transfer_data_to_phone() {
+    need_root
+    create_dirs
+
+    section "Перенести информацию"
+
+    echo "Выбери телефон, в который нужно перенести data:"
+    select_phone || return
+
+    select_backup_folder || return
+
+    local phone_dir phone_name source_data target_data safety_backup ok ts
+    phone_dir="$SELECTED_PHONE_DIR"
+    phone_name="$SELECTED_PHONE_NAME"
+    target_data="$phone_dir/data"
+
+    if [ -d "$SELECTED_BACKUP_DIR/data" ]; then
+        source_data="$SELECTED_BACKUP_DIR/data"
+    else
+        source_data="$SELECTED_BACKUP_DIR"
+    fi
+
+    if [ ! -d "$source_data" ]; then
+        say_red "Источник data не найден: $source_data"
+        return
+    fi
+
+    if [ "$source_data" = "$target_data" ]; then
+        say_red "Нельзя переносить data саму в себя"
+        return
+    fi
+
+    echo
+    say_yellow "ВНИМАНИЕ: текущая data телефона будет заменена."
+    echo "Телефон: $phone_name"
+    echo "Источник: $source_data"
+    echo "Куда: $target_data"
+    echo
+    echo "Перед заменой текущая data будет сохранена в $BACKUP_DIR."
+    echo
+    read -rp "Продолжить? [y/N]: " ok
+
+    if [[ ! "$ok" =~ ^[Yy]$ ]]; then
+        echo "Отмена"
+        return
+    fi
+
+    ts=$(date +%Y%m%d-%H%M%S)
+    safety_backup="$BACKUP_DIR/auto-${phone_name}-${ts}"
+
+    echo
+    echo "Останавливаю телефон..."
+    stop_phone_services "$phone_name"
+    compose_down_phone "$phone_dir"
+    docker rm -f "polmira-${phone_name}" 2>/dev/null || true
+    docker rm -f "polmira-${phone_name}-vpn" 2>/dev/null || true
+
+    echo "Сохраняю текущую data в: $safety_backup"
+    mkdir -p "$safety_backup"
+
+    if [ -d "$target_data" ]; then
+        rsync -a "$target_data"/ "$safety_backup"/
+    fi
+
+    echo "Удаляю старую data..."
+    rm -rf "$target_data"
+    mkdir -p "$target_data"
+
+    echo "Копирую новую data..."
+    rsync -a --delete "$source_data"/ "$target_data"/
+
+    echo "Чищу временные файлы..."
+    clean_redroid_data_after_restore "$target_data"
+
+    echo "Исправляю права..."
+    repair_redroid_data_permissions "$target_data"
+
+    sync
+
+    fix_phone_permissions "$phone_dir"
+    write_compose "$phone_dir"
+    write_systemd_services "$phone_dir"
+
+    echo "Запускаю телефон..."
+    restart_phone_services "$phone_name"
+
+    say_green "Перенос завершён"
+    echo "Автобэкап старой data: $safety_backup"
+}
+
+system_check() {
+    preflight
+
+    echo
+    echo "Docker:"
+    docker --version || true
+    docker compose version || docker-compose --version || true
+
+    echo
+    echo "scrcpy:"
+    scrcpy --version || true
+
+    echo
+    echo "nginx:"
+    nginx -t || true
+
+    echo
+    echo "binderfs:"
+    ls -la /dev/binderfs 2>/dev/null || true
+
+    echo
+    echo "Apps:"
+    echo "$APPS_DIR"
+    find "$APPS_DIR" -maxdepth 1 -type f 2>/dev/null | sed 's/^/    /' || true
+
+    echo
+    echo "Backup:"
+    echo "$BACKUP_DIR"
+    find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sed 's/^/    /' || true
+
+    echo
+    echo "VPN config:"
+    if vpn_is_configured; then
+        echo "OK: $VPN_DIR/config.json"
+    else
+        echo "not configured"
+    fi
+}
+
+install_polmira() {
+    need_root
+
+    preflight
+    create_dirs
+    install_self
+    install_deps
+    ensure_docker_network
+    install_scrcpy
+    install_binderfs_add
+    setup_binderfs_now
+    install_binderfs_service
+    ask_nginx_config
+    fix_all_phone_permissions
+    write_nginx_main_config
+    migrate_existing_phones || true
+    cleanup_broken_nginx_snippets || true
+
+    say_green "Polmira установлена"
+    echo
+    echo "Папка для приложений: $APPS_DIR"
+    echo "Папка для backup data: $BACKUP_DIR"
+}
+
+main_menu() {
+    while true; do
+        clear
+        echo "======================================"
+        echo " Polmira Android Farm"
+        echo "======================================"
+        echo
+        echo "1. Установить / обновить Polmira"
+        echo "2. Создать телефон"
+        echo "3. Список телефонов"
+        echo "4. Включить / перезагрузить телефон"
+        echo "5. Выключить телефон"
+        echo "6. Удалить телефон"
+        echo "7. Установить пароль"
+        echo "8. Проверка системы"
+        echo "9. Настроить VPN"
+        echo "10. Включить VPN для телефона"
+        echo "11. Выключить VPN для телефона"
+        echo "12. Статус VPN"
+        echo "13. Проверить IP телефона"
+        echo "14. Миграция / восстановление телефонов"
+        echo "15. Очистить битые nginx snippets"
+        echo "16. Установить приложение"
+        echo "17. Перенести информацию"
+        echo "0. Выход"
+        echo
+
+        read -rp "Выбор: " choice
+
+        case "$choice" in
+            1) install_polmira; pause ;;
+            2) create_phone; pause ;;
+            3) list_phones; pause ;;
+            4) start_restart_phone; pause ;;
+            5) stop_phone; pause ;;
+            6) delete_phone; pause ;;
+            7) set_phone_password; pause ;;
+            8) system_check; pause ;;
+            9) configure_vpn; pause ;;
+            10) enable_vpn_for_phone; pause ;;
+            11) disable_vpn_for_phone; pause ;;
+            12) vpn_status; pause ;;
+            13) check_phone_ip; pause ;;
+            14) migrate_existing_phones; pause ;;
+            15) cleanup_broken_nginx_snippets; pause ;;
+            16) install_app_to_phone; pause ;;
+            17) transfer_data_to_phone; pause ;;
+            0) exit 0 ;;
+            *) echo "Неверный выбор"; pause ;;
+        esac
+    done
+}
+
+main_menu
