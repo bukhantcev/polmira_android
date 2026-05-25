@@ -16,7 +16,7 @@ NGINX_SITE="/etc/nginx/sites-available/polmira"
 NGINX_SITE_LINK="/etc/nginx/sites-enabled/polmira"
 NGINX_SNIPPETS_DIR="/etc/nginx/polmira"
 
-ADB_RANGE_START=5555
+ADB_RANGE_START=5556
 ADB_RANGE_END=5599
 VNC_RANGE_START=5900
 VNC_RANGE_END=5999
@@ -29,7 +29,7 @@ REDROID_IMAGE="redroid/redroid:11.0.0-latest"
 
 DOCKER_NETWORK="polmira-net"
 VPN_PROXY_HOST="${VPN_PROXY_HOST:-172.17.0.1}"
-VPN_PROXY_PORT="${VPN_PROXY_PORT:-1080}"
+VPN_PROXY_PORT="${VPN_PROXY_PORT:-10809}"
 
 PUBLIC_HOST=""
 USE_HTTPS="no"
@@ -817,7 +817,7 @@ while [ "$count" -lt 180 ]; do
 
         VPN_ENABLED="${VPN_ENABLED:-no}"
         VPN_PROXY_HOST="${VPN_PROXY_HOST:-172.17.0.1}"
-        VPN_PROXY_PORT="${VPN_PROXY_PORT:-1080}"
+        VPN_PROXY_PORT="${VPN_PROXY_PORT:-10809}"
 
         if [ "$VPN_ENABLED" = "yes" ]; then
             echo "Применяю proxy ${VPN_PROXY_HOST}:${VPN_PROXY_PORT}"
@@ -880,9 +880,37 @@ cleanup_own_processes() {
     rm -f "/tmp/.X${DISPLAY_NUM}-lock" "/tmp/.X11-unix/X${DISPLAY_NUM}" 2>/dev/null || true
 }
 
+wait_adb_device() {
+    local state boot count
+
+    echo "Ожидание ADB ${ADB_TARGET}..."
+
+    count=0
+    while [ "$count" -lt 90 ]; do
+        adb disconnect "$ADB_TARGET" >/dev/null 2>&1 || true
+        adb connect "$ADB_TARGET" >/dev/null 2>&1 || true
+
+        state="$(adb -s "$ADB_TARGET" get-state 2>/dev/null || true)"
+        boot="$(adb -s "$ADB_TARGET" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)"
+
+        if [ "$state" = "device" ] && [ "$boot" = "1" ]; then
+            echo "ADB готов: ${ADB_TARGET}"
+            return 0
+        fi
+
+        echo "ADB пока не готов: state=${state:-none} boot=${boot:-none}"
+        sleep 2
+        count=$((count + 1))
+    done
+
+    echo "ADB не готов: ${ADB_TARGET}"
+    return 1
+}
+
 trap cleanup_own_processes EXIT
 
 cleanup_own_processes
+wait_adb_device
 
 Xvfb ":${DISPLAY_NUM}" -screen 0 "$RES" >logs/xvfb.log 2>&1 &
 echo $! > "$RUN_DIR/xvfb.pid"
@@ -907,8 +935,6 @@ if scrcpy --help 2>&1 | grep -q -- "--no-audio"; then
     SCRCPY_AUDIO_ARG="--no-audio"
 fi
 
-adb connect "$ADB_TARGET" >/dev/null 2>&1 || true
-
 DISPLAY=":${DISPLAY_NUM}" scrcpy \
     -s "$ADB_TARGET" \
     $SCRCPY_AUDIO_ARG \
@@ -921,7 +947,13 @@ DISPLAY=":${DISPLAY_NUM}" scrcpy \
     >logs/scrcpy.log 2>&1 &
 echo $! > "$RUN_DIR/scrcpy.pid"
 
-sleep 2
+sleep 3
+
+if ! kill -0 "$(cat "$RUN_DIR/scrcpy.pid")" 2>/dev/null; then
+    echo "scrcpy сразу упал"
+    cat logs/scrcpy.log || true
+    exit 1
+fi
 
 websockify \
     --web=/usr/share/novnc \
@@ -930,7 +962,25 @@ websockify \
     >logs/websockify.log 2>&1 &
 echo $! > "$RUN_DIR/websockify.pid"
 
-wait
+while true; do
+    if ! kill -0 "$(cat "$RUN_DIR/scrcpy.pid")" 2>/dev/null; then
+        echo "scrcpy умер, перезапускаю web-service"
+        cat logs/scrcpy.log || true
+        exit 1
+    fi
+
+    if ! kill -0 "$(cat "$RUN_DIR/x11vnc.pid")" 2>/dev/null; then
+        echo "x11vnc умер"
+        exit 1
+    fi
+
+    if ! kill -0 "$(cat "$RUN_DIR/websockify.pid")" 2>/dev/null; then
+        echo "websockify умер"
+        exit 1
+    fi
+
+    sleep 3
+done
 EOF
 
     chmod +x "$phone_dir/scripts/start-web.sh"
