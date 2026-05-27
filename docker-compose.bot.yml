@@ -1,0 +1,26 @@
+services:
+  polmira-bot:
+    image: chtotos/polmira_bot:latest
+    container_name: polmira-bot
+    restart: unless-stopped
+    privileged: true
+    network_mode: host
+    pid: host
+    env_file:
+      - ./bot/.env
+    environment:
+      POLMIRA_BOT_ENV: /opt/polmira/bot/.env
+      POLMIRA_CMD: /usr/local/bin/polmira
+      POLMIRA_APP_DIR: /opt/polmira
+      POLMIRA_USE_SUDO: "no"
+    volumes:
+      - /opt/polmira:/opt/polmira
+      - ./bot:/opt/polmira/bot:ro
+      - /usr/local/bin/polmira:/usr/local/bin/polmira:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /run/systemd:/run/systemd
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+      - /etc/systemd/system:/etc/systemd/system
+      - /etc/nginx:/etc/nginx
+      - /dev:/dev
+      - /tmp:/tmp
