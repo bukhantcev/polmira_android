@@ -32,6 +32,20 @@ TELEGRAM_PROXY=http://user:password@host:port
 TELEGRAM_PROXY=http://127.0.0.1:10809
 ```
 
+Для MAX бот умеет два режима отправки файлов:
+
+- обычный watcher папки `Download/MAX`;
+- fallback по логам приложения MAX: бот находит ссылки `fd.oneme.ru/getfile`,
+  скачивает файл сервером и отправляет его владельцу телефона.
+
+Если эти ссылки надо скачивать через отдельный прокси, укажи:
+
+```env
+MAX_DOWNLOAD_PROXY=http://172.17.0.1:10809
+```
+
+Если `MAX_DOWNLOAD_PROXY` пустой, используется `TELEGRAM_PROXY`.
+
 Установка приложений из Telegram работает как store: бот показывает только файлы из:
 
 ```text

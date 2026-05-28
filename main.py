@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 import json
+import hashlib
 import mimetypes
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import tempfile
 from pathlib import Path
 
 
@@ -43,7 +46,9 @@ BOT_DIR = APP_DIR / "bot"
 SENT_FILES_STATE = BOT_DIR / "sent-files.json"
 POLL_TIMEOUT = int(os.environ.get("TELEGRAM_POLL_TIMEOUT", "30"))
 TELEGRAM_PROXY = os.environ.get("TELEGRAM_PROXY", "")
+MAX_DOWNLOAD_PROXY = os.environ.get("MAX_DOWNLOAD_PROXY", TELEGRAM_PROXY)
 MAX_WATCH_INTERVAL = int(os.environ.get("MAX_WATCH_INTERVAL", "10"))
+MAX_LOG_LOOKBACK = int(os.environ.get("MAX_LOG_LOOKBACK", "1800"))
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 LOCAL_POLMIRA = SCRIPT_DIR / "polmira1.sh"
@@ -434,6 +439,167 @@ def send_document(chat_id, path, caption):
     )
 
 
+def tail_text(path, max_bytes=2_000_000):
+    try:
+        with path.open("rb") as fh:
+            size = path.stat().st_size
+            if size > max_bytes:
+                fh.seek(size - max_bytes)
+            return fh.read().decode("utf-8", errors="ignore")
+    except OSError:
+        return ""
+
+
+def max_log_urls(phone_dir):
+    logs_dir = phone_dir / "data" / "data" / "ru.oneme.app" / "logs"
+
+    if not logs_dir.exists():
+        return []
+
+    urls = []
+    seen = set()
+
+    cutoff = time.time() - MAX_LOG_LOOKBACK
+
+    for log_path in sorted(logs_dir.glob("*.log"), key=lambda path: path.stat().st_mtime, reverse=True)[:3]:
+        if log_path.stat().st_mtime < cutoff:
+            continue
+
+        text = tail_text(log_path)
+
+        for raw_url in re.findall(r"https://fd\.oneme\.ru/getfile\?[^ \n\r\t'\"<>]+", text):
+            url = raw_url.replace("\\u0026", "&").rstrip(".,;)]}\"'")
+
+            if url not in seen:
+                seen.add(url)
+                urls.append(url)
+
+    return urls
+
+
+def max_url_key(phone_name, url):
+    parsed = urllib.parse.urlparse(url)
+    params = urllib.parse.parse_qs(parsed.query)
+    file_id = (params.get("id") or [""])[0]
+    user_id = (params.get("userId") or [""])[0]
+
+    if file_id:
+        return f"max-url:{phone_name}:{user_id}:{file_id}"
+
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    return f"max-url:{phone_name}:{digest}"
+
+
+def extension_from_download(name, content_type, data):
+    suffix = Path(name).suffix
+
+    if suffix:
+        return ""
+
+    mime_ext = {
+        "image/webp": ".webp",
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/gif": ".gif",
+        "application/pdf": ".pdf",
+        "application/zip": ".zip",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    }.get((content_type or "").split(";", 1)[0].lower())
+
+    if mime_ext:
+        return mime_ext
+
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return ".webp"
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith(b"%PDF"):
+        return ".pdf"
+    if data.startswith(b"PK\x03\x04"):
+        return ".zip"
+
+    return ".bin"
+
+
+def filename_from_response(url, headers, data):
+    disposition = headers.get("Content-Disposition", "")
+    match = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', disposition)
+
+    if match:
+        filename = urllib.parse.unquote(match.group(1)).strip()
+    else:
+        parsed = urllib.parse.urlparse(url)
+        params = urllib.parse.parse_qs(parsed.query)
+        file_id = (params.get("id") or ["file"])[0]
+        filename = f"max_{time.strftime('%Y-%m-%d_%H-%M-%S')}_{file_id}"
+
+    filename = re.sub(r'[\\/:*?"<>|\r\n]+', "_", filename).strip("._ ") or "max_file"
+    return filename + extension_from_download(filename, headers.get_content_type(), data)
+
+
+def download_max_url(url):
+    opener = urllib.request.build_opener()
+
+    if MAX_DOWNLOAD_PROXY:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({
+            "http": MAX_DOWNLOAD_PROXY,
+            "https": MAX_DOWNLOAD_PROXY,
+        }))
+
+    req = urllib.request.Request(url, headers={"User-Agent": "PolmiraBot/1.0"})
+
+    BOT_DIR.mkdir(parents=True, exist_ok=True)
+
+    with opener.open(req, timeout=120) as resp:
+        data = resp.read()
+        filename = filename_from_response(url, resp.headers, data)
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="polmira-max-", dir=str(BOT_DIR)))
+    path = temp_dir / filename
+    path.write_bytes(data)
+    return path
+
+
+def scan_max_log_urls_once(state, _first_scan):
+    changed = False
+
+    for phone_dir in sorted(PHONES_DIR.glob("*")):
+        env = read_phone_env(phone_dir / "phone.env")
+        tg_id = env.get("TG_ID", "")
+        phone_name = env.get("PHONE_NAME", phone_dir.name)
+
+        if not tg_id:
+            continue
+
+        for url in max_log_urls(phone_dir):
+            key = max_url_key(phone_name, url)
+
+            if key in state:
+                continue
+
+            path = None
+
+            try:
+                path = download_max_url(url)
+                send_document(tg_id, path, f"MAX файл с телефона {phone_name}: {path.name}")
+                state[key] = {
+                    "sent_at": int(time.time()),
+                    "size": path.stat().st_size,
+                    "source": "max-log",
+                }
+                changed = True
+                print(f"Sent MAX log URL to {tg_id}: {path.name}")
+            except Exception as exc:
+                print(f"Failed to download/send MAX URL for {phone_name}: {exc}")
+            finally:
+                if path is not None:
+                    shutil.rmtree(path.parent, ignore_errors=True)
+
+    return changed
+
+
 def scan_max_downloads_once():
     state = load_sent_state()
     changed = False
@@ -476,6 +642,9 @@ def scan_max_downloads_once():
                 print(f"Sent MAX file to {tg_id}: {path}")
             except Exception as exc:
                 print(f"Failed to send MAX file {path}: {exc}")
+
+    if scan_max_log_urls_once(state, first_scan):
+        changed = True
 
     if changed:
         save_sent_state(state)

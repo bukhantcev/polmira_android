@@ -215,13 +215,29 @@ ensure_bot_env() {
         cat > "$BOT_ENV_FILE" <<EOF
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_PROXY=
+MAX_DOWNLOAD_PROXY=
 POLMIRA_CMD=/usr/local/bin/polmira
 POLMIRA_APP_DIR=${APP_DIR}
 POLMIRA_USE_SUDO=no
 POLMIRA_COMMAND_TIMEOUT=900
 TELEGRAM_POLL_TIMEOUT=30
 MAX_WATCH_INTERVAL=10
+MAX_LOG_LOOKBACK=1800
 EOF
+        chmod 600 "$BOT_ENV_FILE" || true
+    fi
+
+    bot_env_ensure_key TELEGRAM_PROXY ""
+    bot_env_ensure_key MAX_DOWNLOAD_PROXY ""
+    bot_env_ensure_key MAX_LOG_LOOKBACK "1800"
+}
+
+bot_env_ensure_key() {
+    local key="$1"
+    local default_value="$2"
+
+    if ! grep -qE "^${key}=" "$BOT_ENV_FILE"; then
+        echo "${key}=${default_value}" >> "$BOT_ENV_FILE"
         chmod 600 "$BOT_ENV_FILE" || true
     fi
 }
@@ -2260,10 +2276,11 @@ configure_bot_token() {
 
     section "Настройка Telegram бота"
 
-    local current_token current_proxy token proxy start_answer keep_token
+    local current_token current_proxy current_max_proxy token proxy max_proxy start_answer keep_token
 
     current_token=$(bot_env_get TELEGRAM_BOT_TOKEN)
     current_proxy=$(bot_env_get TELEGRAM_PROXY)
+    current_max_proxy=$(bot_env_get MAX_DOWNLOAD_PROXY)
 
     if [ -n "$current_token" ]; then
         echo "Текущий токен: задан"
@@ -2286,6 +2303,15 @@ configure_bot_token() {
 
     if [ -n "$proxy" ]; then
         bot_env_set TELEGRAM_PROXY "$proxy"
+    fi
+
+    echo
+    echo "Текущий MAX_DOWNLOAD_PROXY: ${current_max_proxy:-пусто, будет TELEGRAM_PROXY}"
+    echo "Пример для скачивания MAX сервером: http://172.17.0.1:10809"
+    read -rp "Новый MAX_DOWNLOAD_PROXY или Enter оставить: " max_proxy
+
+    if [ -n "$max_proxy" ]; then
+        bot_env_set MAX_DOWNLOAD_PROXY "$max_proxy"
     fi
 
     install_bot_files
