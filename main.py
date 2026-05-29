@@ -585,9 +585,11 @@ def scan_max_log_urls_once(state, _first_scan):
                 path = download_max_url(url)
                 send_document(tg_id, path, f"MAX файл с телефона {phone_name}: {path.name}")
                 state[key] = {
+                    "name": path.name,
                     "sent_at": int(time.time()),
                     "size": path.stat().st_size,
                     "source": "max-log",
+                    "url": url,
                 }
                 changed = True
                 print(f"Sent MAX log URL to {tg_id}: {path.name}")
@@ -631,13 +633,26 @@ def scan_max_downloads_once():
                 continue
 
             if first_scan:
-                state[key] = {"sent_at": int(time.time()), "size": path.stat().st_size, "initial": True}
+                state[key] = {
+                    "name": path.name,
+                    "phone": phone_name,
+                    "sent_at": int(time.time()),
+                    "size": path.stat().st_size,
+                    "initial": True,
+                    "source": "max-folder",
+                }
                 changed = True
                 continue
 
             try:
                 send_document(tg_id, path, f"MAX файл с телефона {phone_name}: {path.name}")
-                state[key] = {"sent_at": int(time.time()), "size": path.stat().st_size}
+                state[key] = {
+                    "name": path.name,
+                    "phone": phone_name,
+                    "sent_at": int(time.time()),
+                    "size": path.stat().st_size,
+                    "source": "max-folder",
+                }
                 changed = True
                 print(f"Sent MAX file to {tg_id}: {path}")
             except Exception as exc:
