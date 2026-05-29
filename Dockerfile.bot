@@ -36,7 +36,7 @@ COPY listener/build/polmira-listener.apk /app/polmira-listener.apk
 RUN chmod +x /app/main.py /app/polmira1.sh
 
 ENV POLMIRA_BOT_ENV=/opt/polmira/bot/.env
-ENV POLMIRA_CMD=/usr/local/bin/polmira
+ENV POLMIRA_CMD=/app/polmira1.sh
 ENV POLMIRA_APP_DIR=/opt/polmira
 ENV POLMIRA_USE_SUDO=no
 

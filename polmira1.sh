@@ -198,13 +198,12 @@ services:
       - ${BOT_ENV_FILE}
     environment:
       POLMIRA_BOT_ENV: ${BOT_ENV_FILE}
-      POLMIRA_CMD: /usr/local/bin/polmira
+      POLMIRA_CMD: /app/polmira1.sh
       POLMIRA_APP_DIR: ${APP_DIR}
       POLMIRA_USE_SUDO: "no"
     volumes:
       - ${APP_DIR}:${APP_DIR}
       - ${BOT_DIR}:${BOT_DIR}
-      - /usr/local/bin/polmira:/usr/local/bin/polmira:ro
       - /var/run/docker.sock:/var/run/docker.sock
       - /run/systemd:/run/systemd
       - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
@@ -223,7 +222,7 @@ ensure_bot_env() {
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_PROXY=
 MAX_DOWNLOAD_PROXY=
-POLMIRA_CMD=/usr/local/bin/polmira
+POLMIRA_CMD=/app/polmira1.sh
 POLMIRA_APP_DIR=${APP_DIR}
 POLMIRA_USE_SUDO=no
 POLMIRA_COMMAND_TIMEOUT=900
@@ -284,12 +283,11 @@ services:
       - ${WEB_ENV_FILE}
     environment:
       POLMIRA_APP_DIR: ${APP_DIR}
-      POLMIRA_CMD: /usr/local/bin/polmira
+      POLMIRA_CMD: /app/polmira1.sh
       POLMIRA_WEB_HOST: 127.0.0.1
       POLMIRA_WEB_PORT: "8787"
     volumes:
       - ${APP_DIR}:${APP_DIR}
-      - /usr/local/bin/polmira:/usr/local/bin/polmira:ro
       - /var/run/docker.sock:/var/run/docker.sock
       - /run/systemd:/run/systemd
       - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
@@ -1554,6 +1552,47 @@ stop_phone_services() {
     systemctl stop "polmira-phone-${phone_name}-init.service" 2>/dev/null || true
 }
 
+cleanup_max_file_state_for_phone() {
+    local phone_name="$1"
+    local phone_dir="$2"
+    local state_file="$BOT_DIR/sent-files.json"
+
+    [ -f "$state_file" ] || return 0
+
+    python3 - "$state_file" "$phone_name" "$phone_dir" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+phone = sys.argv[2]
+phone_dir = sys.argv[3].rstrip("/")
+max_prefix = f"{phone_dir}/data/media/0/Download/MAX/"
+url_prefix = f"max-url:{phone}:"
+
+try:
+    state = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    state = {}
+
+if not isinstance(state, dict):
+    state = {}
+
+cleaned = {
+    key: value
+    for key, value in state.items()
+    if not (
+        str(key).startswith(max_prefix)
+        or str(key).startswith(url_prefix)
+        or (isinstance(value, dict) and value.get("phone") == phone)
+    )
+}
+
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
 compose_down_phone() {
     local phone_dir="$1"
 
@@ -1849,6 +1888,7 @@ delete_phone() {
     docker rm -f "polmira-${phone_name}" 2>/dev/null || true
     docker rm -f "polmira-${phone_name}-vpn" 2>/dev/null || true
 
+    cleanup_max_file_state_for_phone "$phone_name" "$phone_dir" || true
     remove_phone_nginx_conf "$phone_name"
     rm -rf "$phone_dir"
 
@@ -2887,6 +2927,7 @@ bot_delete_phone() {
     compose_down_phone "$phone_dir"
     docker rm -f "polmira-${phone_name}" 2>/dev/null || true
     docker rm -f "polmira-${phone_name}-vpn" 2>/dev/null || true
+    cleanup_max_file_state_for_phone "$phone_name" "$phone_dir" || true
     remove_phone_nginx_conf "$phone_name"
     rm -rf "$phone_dir"
 

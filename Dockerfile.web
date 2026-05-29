@@ -17,12 +17,13 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY web/server.py /app/server.py
+COPY polmira1.sh /app/polmira1.sh
 COPY listener/build/polmira-listener.apk /app/polmira-listener.apk
 
-RUN chmod +x /app/server.py
+RUN chmod +x /app/server.py /app/polmira1.sh
 
 ENV POLMIRA_APP_DIR=/opt/polmira
-ENV POLMIRA_CMD=/usr/local/bin/polmira
+ENV POLMIRA_CMD=/app/polmira1.sh
 ENV POLMIRA_WEB_HOST=0.0.0.0
 ENV POLMIRA_WEB_PORT=8787
 

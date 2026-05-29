@@ -586,6 +586,7 @@ def scan_max_log_urls_once(state, _first_scan):
                 send_document(tg_id, path, f"MAX файл: {path.name}")
                 state[key] = {
                     "name": path.name,
+                    "phone": phone_name,
                     "sent_at": int(time.time()),
                     "size": path.stat().st_size,
                     "source": "max-log",
@@ -606,57 +607,6 @@ def scan_max_downloads_once():
     state = load_sent_state()
     changed = False
     first_scan = not SENT_FILES_STATE.exists()
-
-    for phone_dir in sorted(PHONES_DIR.glob("*")):
-        env = read_phone_env(phone_dir / "phone.env")
-        tg_id = env.get("TG_ID", "")
-        phone_name = env.get("PHONE_NAME", phone_dir.name)
-
-        if not tg_id:
-            continue
-
-        max_dir = phone_dir / "data" / "media" / "0" / "Download" / "MAX"
-
-        if not max_dir.exists():
-            continue
-
-        for path in sorted(max_dir.rglob("*")):
-            if not path.is_file():
-                continue
-
-            key = str(path)
-
-            if key in state:
-                continue
-
-            if not file_is_stable(path):
-                continue
-
-            if first_scan:
-                state[key] = {
-                    "name": path.name,
-                    "phone": phone_name,
-                    "sent_at": int(time.time()),
-                    "size": path.stat().st_size,
-                    "initial": True,
-                    "source": "max-folder",
-                }
-                changed = True
-                continue
-
-            try:
-                send_document(tg_id, path, f"MAX файл: {path.name}")
-                state[key] = {
-                    "name": path.name,
-                    "phone": phone_name,
-                    "sent_at": int(time.time()),
-                    "size": path.stat().st_size,
-                    "source": "max-folder",
-                }
-                changed = True
-                print(f"Sent MAX file to {tg_id}: {path}")
-            except Exception as exc:
-                print(f"Failed to send MAX file {path}: {exc}")
 
     if scan_max_log_urls_once(state, first_scan):
         changed = True
