@@ -449,8 +449,150 @@ def handle_app_install(chat_id, tg_id, data):
     send_message(chat_id, output or "Приложение установлено.", PHONE_MENU)
 
 
-def handle_document(chat_id, tg_id, message):
-    send_message(chat_id, "Установка доступна только из store: файлы должны лежать в /opt/polmira/apps.")
+def phone_dir_for_tg_id(tg_id):
+    wanted = str(tg_id)
+
+    for phone_dir in sorted(PHONES_DIR.glob("*")):
+        if not phone_dir.is_dir():
+            continue
+
+        env = read_phone_env(phone_dir / "phone.env")
+
+        if env.get("TG_ID") == wanted:
+            return phone_dir
+
+    return None
+
+
+def sanitize_filename(name):
+    clean = re.sub(r'[\\/:*?"<>|\r\n]+', "_", name or "").strip("._ ")
+    return clean[:180] or "telegram-file"
+
+
+def unique_path(path):
+    if not path.exists():
+        return path
+
+    stem = path.stem
+    suffix = path.suffix
+
+    for index in range(1, 1000):
+        candidate = path.with_name(f"{stem}_{index}{suffix}")
+
+        if not candidate.exists():
+            return candidate
+
+    return path.with_name(f"{stem}_{int(time.time())}{suffix}")
+
+
+def media_from_message(message):
+    if message.get("document"):
+        item = message["document"]
+        return item["file_id"], item.get("file_name"), "document", item.get("mime_type", "")
+
+    if message.get("photo"):
+        item = sorted(message["photo"], key=lambda part: part.get("file_size", 0))[-1]
+        return item["file_id"], None, "photo", "image/jpeg"
+
+    for key, default_ext in (
+        ("video", ".mp4"),
+        ("animation", ".mp4"),
+        ("audio", ".mp3"),
+        ("voice", ".ogg"),
+        ("video_note", ".mp4"),
+        ("sticker", ".webp"),
+    ):
+        if message.get(key):
+            item = message[key]
+            name = item.get("file_name") or f"{key}_{time.strftime('%Y-%m-%d_%H-%M-%S')}{default_ext}"
+            return item["file_id"], name, key, item.get("mime_type", "")
+
+    return None, None, None, None
+
+
+def extension_from_telegram(file_path, mime_type, fallback):
+    suffix = Path(file_path or "").suffix
+
+    if suffix:
+        return suffix
+
+    if mime_type:
+        guessed = mimetypes.guess_extension(mime_type.split(";", 1)[0].lower())
+
+        if guessed:
+            return guessed
+
+    return fallback
+
+
+def download_telegram_file(file_id):
+    info = api("getFile", {"file_id": file_id})
+    file_path = info.get("file_path", "")
+
+    if not file_path:
+        raise RuntimeError("Telegram не вернул путь файла")
+
+    url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+
+    with urllib.request.urlopen(url, timeout=180) as resp:
+        data = resp.read()
+
+    return data, file_path
+
+
+def fix_android_media_permissions(path):
+    try:
+        os.chown(path, 1023, 1023)
+    except PermissionError:
+        pass
+    except OSError:
+        pass
+
+    try:
+        if path.is_dir():
+            path.chmod(0o775)
+        else:
+            path.chmod(0o644)
+    except OSError:
+        pass
+
+
+def save_message_file_to_phone(tg_id, message):
+    phone_dir = phone_dir_for_tg_id(tg_id)
+
+    if phone_dir is None:
+        raise RuntimeError("Телефон для этого Telegram ID не найден")
+
+    file_id, original_name, kind, mime_type = media_from_message(message)
+
+    if not file_id:
+        raise RuntimeError("Не нашёл файл в сообщении")
+
+    data, telegram_path = download_telegram_file(file_id)
+    max_dir = phone_dir / "data" / "media" / "0" / "Download" / "MAX"
+    max_dir.mkdir(parents=True, exist_ok=True)
+    fix_android_media_permissions(max_dir)
+
+    if original_name:
+        filename = sanitize_filename(original_name)
+    else:
+        ext = extension_from_telegram(telegram_path, mime_type, ".bin")
+        filename = f"telegram_{kind}_{time.strftime('%Y-%m-%d_%H-%M-%S')}{ext}"
+
+    destination = unique_path(max_dir / filename)
+    destination.write_bytes(data)
+    fix_android_media_permissions(destination)
+    return destination
+
+
+def handle_file_message(chat_id, tg_id, message):
+    try:
+        path = save_message_file_to_phone(tg_id, message)
+    except RuntimeError as exc:
+        send_message(chat_id, f"Не получилось сохранить файл:\n{exc}", PHONE_MENU)
+        return
+
+    send_message(chat_id, f"Сохранил в MAX:\n{path.name}", PHONE_MENU)
 
 
 def read_phone_env(path):
@@ -726,8 +868,8 @@ def handle_message(message):
     if not chat_id or not tg_id:
         return
 
-    if message.get("document"):
-        handle_document(chat_id, tg_id, message)
+    if any(message.get(key) for key in ("document", "photo", "video", "animation", "audio", "voice", "video_note", "sticker")):
+        handle_file_message(chat_id, tg_id, message)
         return
 
     pending = PENDING_ACTIONS.get(str(tg_id))
