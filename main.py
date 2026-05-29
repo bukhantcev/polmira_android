@@ -583,7 +583,7 @@ def scan_max_log_urls_once(state, _first_scan):
 
             try:
                 path = download_max_url(url)
-                send_document(tg_id, path, f"MAX файл с телефона {phone_name}: {path.name}")
+                send_document(tg_id, path, f"MAX файл: {path.name}")
                 state[key] = {
                     "name": path.name,
                     "sent_at": int(time.time()),
@@ -645,7 +645,7 @@ def scan_max_downloads_once():
                 continue
 
             try:
-                send_document(tg_id, path, f"MAX файл с телефона {phone_name}: {path.name}")
+                send_document(tg_id, path, f"MAX файл: {path.name}")
                 state[key] = {
                     "name": path.name,
                     "phone": phone_name,

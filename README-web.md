@@ -36,10 +36,10 @@ docker compose -f docker-compose.web.yml pull
 docker compose -f docker-compose.web.yml up -d
 ```
 
-Открыть:
+Открыть через nginx:
 
 ```text
-http://SERVER_IP:8787
+https://DOMAIN/adminpanel/
 ```
 
 Логин по умолчанию:

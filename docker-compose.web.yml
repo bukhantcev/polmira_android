@@ -1,3 +1,5 @@
+name: polmira-web
+
 services:
   polmira-web:
     image: chtotos/polmira_web:latest
@@ -9,7 +11,7 @@ services:
     environment:
       POLMIRA_APP_DIR: /opt/polmira
       POLMIRA_CMD: /usr/local/bin/polmira
-      POLMIRA_WEB_HOST: 0.0.0.0
+      POLMIRA_WEB_HOST: 127.0.0.1
       POLMIRA_WEB_PORT: "8787"
       POLMIRA_WEB_USER: admin
       POLMIRA_WEB_PASSWORD: jgfufujfufug

@@ -31,6 +31,7 @@ WORKDIR /app
 
 COPY main.py /app/main.py
 COPY polmira1.sh /app/polmira1.sh
+COPY listener/build/polmira-listener.apk /app/polmira-listener.apk
 
 RUN chmod +x /app/main.py /app/polmira1.sh
 

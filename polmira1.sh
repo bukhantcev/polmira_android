@@ -12,6 +12,10 @@ CONFIG_FILE="$APP_DIR/config.env"
 BOT_DIR="$APP_DIR/bot"
 BOT_ENV_FILE="$BOT_DIR/.env"
 BOT_COMPOSE_FILE="$APP_DIR/docker-compose.bot.yml"
+WEB_DIR="$APP_DIR/web"
+WEB_ENV_FILE="$WEB_DIR/.env"
+WEB_COMPOSE_FILE="$APP_DIR/docker-compose.web.yml"
+LISTENER_APK_FILE="$APPS_DIR/polmira-listener.apk"
 TG_ALLOWED_FILE="$APP_DIR/tg-allowed.txt"
 MAX_FILE_SENDERS_FILE="$APP_DIR/max-file-senders.txt"
 
@@ -32,6 +36,7 @@ SCRCPY_VERSION="3.3.4"
 SING_BOX_IMAGE="ghcr.io/sagernet/sing-box:latest"
 REDROID_IMAGE="redroid/redroid:11.0.0-latest"
 POLMIRA_BOT_IMAGE="chtotos/polmira_bot:latest"
+POLMIRA_WEB_IMAGE="chtotos/polmira_web:latest"
 
 DOCKER_NETWORK="polmira-net"
 VPN_PROXY_HOST="${VPN_PROXY_HOST:-172.17.0.1}"
@@ -88,7 +93,7 @@ systemctl() {
 }
 
 create_dirs() {
-    mkdir -p "$APP_DIR" "$PHONES_DIR" "$SCRIPTS_DIR" "$LOGS_DIR" "$VPN_DIR" "$APPS_DIR" "$BACKUP_DIR" "$BOT_DIR" "$NGINX_SNIPPETS_DIR"
+    mkdir -p "$APP_DIR" "$PHONES_DIR" "$SCRIPTS_DIR" "$LOGS_DIR" "$VPN_DIR" "$APPS_DIR" "$BACKUP_DIR" "$BOT_DIR" "$WEB_DIR" "$NGINX_SNIPPETS_DIR"
     touch "$TG_ALLOWED_FILE" "$MAX_FILE_SENDERS_FILE" 2>/dev/null || true
 }
 
@@ -179,6 +184,8 @@ write_bot_compose() {
     create_dirs
 
     cat > "$BOT_COMPOSE_FILE" <<EOF
+name: polmira-bot
+
 services:
   polmira-bot:
     image: ${POLMIRA_BOT_IMAGE}
@@ -259,6 +266,263 @@ bot_env_set() {
     chmod 600 "$BOT_ENV_FILE" || true
 }
 
+write_web_compose() {
+    create_dirs
+
+    cat > "$WEB_COMPOSE_FILE" <<EOF
+name: polmira-web
+
+services:
+  polmira-web:
+    image: ${POLMIRA_WEB_IMAGE}
+    container_name: polmira-web
+    restart: unless-stopped
+    privileged: true
+    network_mode: host
+    pid: host
+    env_file:
+      - ${WEB_ENV_FILE}
+    environment:
+      POLMIRA_APP_DIR: ${APP_DIR}
+      POLMIRA_CMD: /usr/local/bin/polmira
+      POLMIRA_WEB_HOST: 127.0.0.1
+      POLMIRA_WEB_PORT: "8787"
+    volumes:
+      - ${APP_DIR}:${APP_DIR}
+      - /usr/local/bin/polmira:/usr/local/bin/polmira:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /run/systemd:/run/systemd
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+      - /etc/systemd/system:/etc/systemd/system
+      - /etc/nginx:/etc/nginx
+      - /dev:/dev
+      - /tmp:/tmp
+EOF
+}
+
+ensure_web_env() {
+    create_dirs
+
+    if [ ! -f "$WEB_ENV_FILE" ]; then
+        local password
+        local listener_secret
+        password=$(openssl rand -base64 18 | tr -d '\n')
+        listener_secret=$(openssl rand -hex 24 | tr -d '\n')
+
+        cat > "$WEB_ENV_FILE" <<EOF
+POLMIRA_WEB_USER=admin
+POLMIRA_WEB_PASSWORD=${password}
+POLMIRA_LISTENER_SECRET=${listener_secret}
+POLMIRA_WEB_COMMAND_TIMEOUT=900
+EOF
+        chmod 600 "$WEB_ENV_FILE" || true
+    fi
+
+    web_env_ensure_key POLMIRA_WEB_USER "admin"
+    web_env_ensure_key POLMIRA_LISTENER_SECRET "$(openssl rand -hex 24 | tr -d '\n')"
+    web_env_ensure_key POLMIRA_WEB_COMMAND_TIMEOUT "900"
+}
+
+web_env_ensure_key() {
+    local key="$1"
+    local default_value="$2"
+
+    if ! grep -qE "^${key}=" "$WEB_ENV_FILE"; then
+        echo "${key}=${default_value}" >> "$WEB_ENV_FILE"
+        chmod 600 "$WEB_ENV_FILE" || true
+    fi
+}
+
+web_env_get() {
+    local key="$1"
+
+    ensure_web_env
+    grep -E "^${key}=" "$WEB_ENV_FILE" | tail -n 1 | cut -d= -f2- || true
+}
+
+web_env_set() {
+    local key="$1"
+    local value="$2"
+
+    ensure_web_env
+    sed -i "/^${key}=/d" "$WEB_ENV_FILE"
+    echo "${key}=${value}" >> "$WEB_ENV_FILE"
+    chmod 600 "$WEB_ENV_FILE" || true
+}
+
+listener_webhook_url() {
+    local configured
+    configured="$(web_env_get POLMIRA_LISTENER_WEBHOOK_URL || true)"
+
+    if [ -n "$configured" ]; then
+        echo "$configured"
+        return
+    fi
+
+    echo "$(public_base_url)/adminpanel/api/listener/event"
+}
+
+ensure_listener_apk() {
+    create_dirs
+    mkdir -p "$APPS_DIR"
+
+    if [ -f "/app/polmira-listener.apk" ]; then
+        cp "/app/polmira-listener.apk" "$LISTENER_APK_FILE"
+        chmod 644 "$LISTENER_APK_FILE" || true
+        return 0
+    fi
+
+    if [ -f "$LISTENER_APK_FILE" ]; then
+        return 0
+    fi
+
+    return 1
+}
+
+configure_listener_for_phone_dir() {
+    local phone_dir="$1"
+
+    [ -f "$phone_dir/phone.env" ] || return 1
+
+    source "$phone_dir/phone.env"
+
+    local adb_target webhook secret component current updated
+    adb_target="127.0.0.1:${ADB_PORT}"
+    webhook="$(listener_webhook_url)"
+    secret="$(web_env_get POLMIRA_LISTENER_SECRET)"
+    component="ru.polmira.listener/ru.polmira.listener.MaxNotificationListener"
+
+    adb -s "$adb_target" shell am broadcast \
+        -a ru.polmira.listener.CONFIGURE \
+        -n ru.polmira.listener/.ConfigReceiver \
+        --es webhook_url "$webhook" \
+        --es secret "$secret" \
+        --es phone "$PHONE_NAME" \
+        --es target_package ru.oneme.app
+
+    current="$(adb -s "$adb_target" shell settings get secure enabled_notification_listeners 2>/dev/null | tr -d '\r' || true)"
+    if [[ "$current" != *"$component"* ]]; then
+        if [ -z "$current" ] || [ "$current" = "null" ]; then
+            updated="$component"
+        else
+            updated="${current}:$component"
+        fi
+        adb -s "$adb_target" shell settings put secure enabled_notification_listeners "$updated" >/dev/null || true
+    fi
+
+    adb -s "$adb_target" shell cmd notification allow_listener "$component" >/dev/null 2>&1 || true
+}
+
+install_listener_to_phone_dir() {
+    local phone_dir="$1"
+
+    [ -f "$phone_dir/phone.env" ] || return 1
+
+    ensure_web_env
+
+    if ! ensure_listener_apk; then
+        say_yellow "Polmira Listener APK не найден, пропускаю автоустановку"
+        return 0
+    fi
+
+    source "$phone_dir/phone.env"
+
+    local adb_target remote_apk
+    adb_target="127.0.0.1:${ADB_PORT}"
+    remote_apk="/data/local/tmp/polmira-listener.apk"
+
+    wait_phone_ready_by_dir "$phone_dir" || return 1
+
+    echo "Устанавливаю Polmira Listener..."
+    adb -s "$adb_target" push "$LISTENER_APK_FILE" "$remote_apk" >/dev/null
+    adb -s "$adb_target" shell pm install -r -d -g "$remote_apk" >/dev/null
+    adb -s "$adb_target" shell rm -f "$remote_apk" >/dev/null 2>&1 || true
+
+    configure_listener_for_phone_dir "$phone_dir" || true
+    say_green "Polmira Listener установлен"
+}
+
+install_web_files() {
+    create_dirs
+    ensure_web_env
+    write_web_compose
+}
+
+write_adminpanel_nginx_conf() {
+    create_dirs
+
+    cat > "${NGINX_SNIPPETS_DIR}/adminpanel.conf" <<EOF
+location = /adminpanel {
+    return 302 /adminpanel/;
+}
+
+location /adminpanel/ {
+    proxy_pass http://127.0.0.1:8787/;
+
+    proxy_http_version 1.1;
+
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection \$polmira_connection_upgrade;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+
+    proxy_read_timeout 86400;
+    proxy_send_timeout 86400;
+}
+EOF
+
+    nginx -t
+    systemctl reload nginx
+}
+
+start_web_container() {
+    local cmd
+
+    install_web_files
+    write_adminpanel_nginx_conf
+    cmd=$(bot_compose_cmd) || return 1
+
+    $cmd -f "$WEB_COMPOSE_FILE" pull
+    docker rm -f polmira-web >/dev/null 2>&1 || true
+    $cmd -f "$WEB_COMPOSE_FILE" up -d
+
+    say_green "Web панель запущена"
+    echo "URL: $(public_base_url)/adminpanel/"
+    echo "Логин: $(web_env_get POLMIRA_WEB_USER)"
+    echo "Пароль: $(web_env_get POLMIRA_WEB_PASSWORD)"
+    echo "Listener secret: $(web_env_get POLMIRA_LISTENER_SECRET)"
+}
+
+configure_web_panel() {
+    local user password restart_answer
+
+    section "Настройка web панели"
+
+    install_web_files
+
+    echo "Текущий логин: $(web_env_get POLMIRA_WEB_USER)"
+    echo "Listener secret: $(web_env_get POLMIRA_LISTENER_SECRET)"
+    read -rp "Новый логин или Enter оставить: " user
+    if [ -n "$user" ]; then
+        web_env_set POLMIRA_WEB_USER "$user"
+    fi
+
+    read -rsp "Новый пароль панели или Enter оставить: " password
+    echo
+    if [ -n "$password" ]; then
+        web_env_set POLMIRA_WEB_PASSWORD "$password"
+    fi
+
+    write_adminpanel_nginx_conf
+
+    read -rp "Перезапустить web панель сейчас? [Y/n]: " restart_answer
+    if ! [[ "$restart_answer" =~ ^[Nn]$ ]]; then
+        start_web_container
+    fi
+}
+
 install_bot_files() {
     create_dirs
     ensure_bot_env
@@ -273,6 +537,7 @@ start_bot_container() {
 
     cd "$APP_DIR"
     $cmd -f "$BOT_COMPOSE_FILE" pull
+    docker rm -f polmira-bot >/dev/null 2>&1 || true
     $cmd -f "$BOT_COMPOSE_FILE" up -d
 }
 
@@ -657,7 +922,8 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
+    listen 443 ssl;
+    http2 on;
     server_name ${PUBLIC_HOST};
 
     ssl_certificate ${effective_cert};
@@ -1404,6 +1670,9 @@ EOF
     restart_phone_services "$phone_name"
     wait_phone_web_by_dir "$phone_dir" || return 1
 
+    ensure_listener_apk || true
+    install_all_apps_to_phone_dir "$phone_dir" || true
+
     phone_url=$(novnc_url "$web_path")
 
     say_green "Телефон создан"
@@ -1829,6 +2098,7 @@ repair_nginx_config() {
     migrate_existing_phones || true
     cleanup_broken_nginx_snippets || true
     write_nginx_main_config
+    write_adminpanel_nginx_conf || true
 
     echo
     echo "Snippets:"
@@ -1932,7 +2202,7 @@ select_app_file() {
 
     create_dirs
 
-    mapfile -t files < <(find "$APPS_DIR" -maxdepth 1 -type f \( -iname "*.apk" -o -iname "*.apkm" -o -iname "*.xapk" -o -iname "*.apks" \) | sort)
+    mapfile -t files < <(app_store_files)
 
     if [ "${#files[@]}" -eq 0 ]; then
         say_red "Приложений нет."
@@ -1964,6 +2234,17 @@ select_app_file() {
     fi
 
     SELECTED_FILE="${files[$idx]}"
+}
+
+app_store_files() {
+    create_dirs
+    find "$APPS_DIR" -maxdepth 1 -type f \( \
+        -iname "*.apk" -o \
+        -iname "*.apkm" -o \
+        -iname "*.xapk" -o \
+        -iname "*.apks" -o \
+        -iname "*.zip" \
+    \) | sort
 }
 
 install_app_file_to_phone_dir() {
@@ -2046,9 +2327,53 @@ install_app_file_to_phone_dir() {
     adb -s "$adb_target" shell am force-stop com.android.launcher3 >/dev/null 2>&1 || true
     adb -s "$adb_target" shell monkey -p com.android.launcher3 1 >/dev/null 2>&1 || true
 
+    if adb -s "$adb_target" shell pm path ru.polmira.listener >/dev/null 2>&1; then
+        echo
+        echo "Настраиваю Polmira Listener..."
+        configure_listener_for_phone_dir "$phone_dir" || true
+    fi
+
     systemctl restart "polmira-phone-${PHONE_NAME}-web.service" || true
 
     say_green "Приложение установлено"
+}
+
+install_all_apps_to_phone_dir() {
+    local phone_dir="$1"
+    local app_file failed installed
+    local -a app_files
+
+    [ -f "$phone_dir/phone.env" ] || return 1
+
+    source "$phone_dir/phone.env"
+
+    failed=0
+    installed=0
+
+    mapfile -t app_files < <(app_store_files)
+
+    if [ "${#app_files[@]}" -eq 0 ]; then
+        say_yellow "В $APPS_DIR нет приложений для автоустановки"
+        return 0
+    fi
+
+    section "Автоустановка приложений из $APPS_DIR"
+
+    for app_file in "${app_files[@]}"; do
+        if install_app_file_to_phone_dir "$phone_dir" "$app_file"; then
+            installed=$((installed + 1))
+        else
+            failed=$((failed + 1))
+            say_yellow "Не удалось установить: $(basename "$app_file")"
+        fi
+    done
+
+    echo "Установлено: $installed"
+    if [ "$failed" -gt 0 ]; then
+        say_yellow "Ошибок установки: $failed"
+    fi
+
+    return 0
 }
 
 install_app_to_phone() {
@@ -2396,6 +2721,8 @@ install_polmira() {
     migrate_existing_phones || true
     cleanup_broken_nginx_snippets || true
     install_bot_files
+    install_web_files
+    write_adminpanel_nginx_conf || true
 
     if [ -z "$(bot_env_get TELEGRAM_BOT_TOKEN)" ]; then
         say_yellow "Telegram bot token пока пустой."
@@ -2404,11 +2731,15 @@ install_polmira() {
         start_bot_container || true
     fi
 
+    start_web_container || true
+
     say_green "Polmira установлена"
     echo
     echo "Папка для приложений: $APPS_DIR"
     echo "Папка для backup data: $BACKUP_DIR"
     echo "Файл бота: $BOT_ENV_FILE"
+    echo "Файл web панели: $WEB_ENV_FILE"
+    echo "Web панель: $(public_base_url)/adminpanel/"
 }
 
 bot_phone_dir_or_fail() {
@@ -2665,6 +2996,8 @@ main_menu() {
         echo "19. Редактировать разрешённые Telegram ID"
         echo "20. Запустить / обновить бота"
         echo "21. Ремонт nginx / ссылок"
+        echo "22. Настроить web панель"
+        echo "23. Запустить / обновить web панель"
         echo "0. Выход"
         echo
 
@@ -2692,6 +3025,8 @@ main_menu() {
             19) manage_allowed_tg_ids; pause ;;
             20) start_bot_container; pause ;;
             21) repair_nginx_config; pause ;;
+            22) configure_web_panel; pause ;;
+            23) start_web_container; pause ;;
             0) exit 0 ;;
             *) echo "Неверный выбор"; pause ;;
         esac

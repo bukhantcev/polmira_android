@@ -1,3 +1,5 @@
+name: polmira-bot
+
 services:
   polmira-bot:
     image: chtotos/polmira_bot:latest

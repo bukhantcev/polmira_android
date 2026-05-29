@@ -17,6 +17,7 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY web/server.py /app/server.py
+COPY listener/build/polmira-listener.apk /app/polmira-listener.apk
 
 RUN chmod +x /app/server.py
 
