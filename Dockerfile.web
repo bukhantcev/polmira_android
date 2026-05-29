@@ -1,0 +1,28 @@
+FROM python:3.12-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        adb \
+        ca-certificates \
+        docker.io \
+        docker-compose \
+        iproute2 \
+        netcat-openbsd \
+        openssl \
+        procps \
+        systemd \
+        util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY web/server.py /app/server.py
+
+RUN chmod +x /app/server.py
+
+ENV POLMIRA_APP_DIR=/opt/polmira
+ENV POLMIRA_CMD=/usr/local/bin/polmira
+ENV POLMIRA_WEB_HOST=0.0.0.0
+ENV POLMIRA_WEB_PORT=8787
+
+CMD ["python3", "/app/server.py"]

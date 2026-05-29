@@ -1,0 +1,24 @@
+services:
+  polmira-web:
+    image: chtotos/polmira_web:latest
+    container_name: polmira-web
+    restart: unless-stopped
+    privileged: true
+    network_mode: host
+    pid: host
+    environment:
+      POLMIRA_APP_DIR: /opt/polmira
+      POLMIRA_CMD: /usr/local/bin/polmira
+      POLMIRA_WEB_HOST: 0.0.0.0
+      POLMIRA_WEB_PORT: "8787"
+      POLMIRA_WEB_USER: admin
+      POLMIRA_WEB_PASSWORD: jgfufujfufug
+    volumes:
+      - /opt/polmira:/opt/polmira
+      - /usr/local/bin/polmira:/usr/local/bin/polmira:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /run/systemd:/run/systemd
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+      - /etc/systemd/system:/etc/systemd/system
+      - /dev:/dev
+      - /tmp:/tmp
