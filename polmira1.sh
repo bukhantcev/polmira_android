@@ -387,7 +387,11 @@ configure_listener_for_phone_dir() {
     local adb_target webhook secret component current updated
     adb_target="127.0.0.1:${ADB_PORT}"
     webhook="$(listener_webhook_url)"
-    secret="$(web_env_get POLMIRA_LISTENER_SECRET)"
+    secret="${LISTENER_SECRET:-}"
+    if [ -z "$secret" ]; then
+        secret="$(openssl rand -hex 24 | tr -d '\n')"
+        phone_env_set "$phone_dir" "LISTENER_SECRET" "$secret"
+    fi
     component="ru.polmira.listener/ru.polmira.listener.MaxNotificationListener"
 
     adb -s "$adb_target" shell am broadcast \
@@ -1689,6 +1693,7 @@ DISPLAY=:${display_num}
 WEB_PATH=${web_path}
 USERNAME=${default_user}
 VPN_ENABLED=no
+LISTENER_SECRET=$(openssl rand -hex 24 | tr -d '\n')
 EOF
 
     set_phone_password_files "$phone_dir" "$default_user" "$default_pass"
