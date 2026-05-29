@@ -49,6 +49,7 @@ TELEGRAM_PROXY = os.environ.get("TELEGRAM_PROXY", "")
 MAX_DOWNLOAD_PROXY = os.environ.get("MAX_DOWNLOAD_PROXY", TELEGRAM_PROXY)
 MAX_WATCH_INTERVAL = int(os.environ.get("MAX_WATCH_INTERVAL", "10"))
 MAX_LOG_LOOKBACK = int(os.environ.get("MAX_LOG_LOOKBACK", "1800"))
+PENDING_ACTIONS = {}
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 LOCAL_POLMIRA = SCRIPT_DIR / "polmira1.sh"
@@ -73,6 +74,9 @@ PHONE_MENU = {
         ],
         [
             {"text": "Выключить VPN", "callback_data": "vpn_off"},
+            {"text": "Сменить логин/пароль", "callback_data": "change_password"},
+        ],
+        [
             {"text": "Удалить телефон", "callback_data": "delete_confirm"},
         ],
         [{"text": "Обновить статус", "callback_data": "refresh"}],
@@ -88,6 +92,10 @@ DELETE_CONFIRM_MENU = {
         [{"text": "Да, удалить", "callback_data": "delete"}],
         [{"text": "Отмена", "callback_data": "refresh"}],
     ]
+}
+
+PENDING_MENU = {
+    "inline_keyboard": [[{"text": "Отмена", "callback_data": "cancel"}]]
 }
 
 
@@ -333,6 +341,60 @@ def handle_delete(chat_id, tg_id):
         return
 
     send_message(chat_id, output or "Телефон удалён.", CREATE_MENU)
+
+
+def ask_password_change(chat_id, tg_id):
+    PENDING_ACTIONS[str(tg_id)] = {
+        "action": "change_password",
+        "created_at": time.time(),
+    }
+    send_message(
+        chat_id,
+        "Отправь новый логин и пароль одной строкой:\n"
+        "login password\n\n"
+        "Логин: латиница/цифры/._-, до 64 символов.\n"
+        "Пароль: минимум 4 символа.",
+        PENDING_MENU,
+    )
+
+
+def cancel_pending(chat_id, tg_id):
+    PENDING_ACTIONS.pop(str(tg_id), None)
+    send_message(chat_id, "Отменено.", PHONE_MENU)
+
+
+def handle_password_message(chat_id, tg_id, text):
+    parts = text.strip().split(maxsplit=1)
+
+    if len(parts) != 2:
+        send_message(chat_id, "Нужно одной строкой: login password", PENDING_MENU)
+        return
+
+    username, password = parts
+
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", username):
+        send_message(chat_id, "Логин только латиница/цифры/._-, до 64 символов.", PENDING_MENU)
+        return
+
+    if len(password) < 4:
+        send_message(chat_id, "Пароль слишком короткий, минимум 4 символа.", PENDING_MENU)
+        return
+
+    PENDING_ACTIONS.pop(str(tg_id), None)
+    send_message(chat_id, "Меняю логин и пароль noVNC...")
+
+    try:
+        output = run_polmira("bot-set-password", str(tg_id), username, password)
+    except RuntimeError as exc:
+        send_message(chat_id, f"Не получилось сменить логин/пароль:\n{exc}", PHONE_MENU)
+        return
+
+    info = parse_env_output(output)
+
+    if info:
+        send_message(chat_id, render_phone_status(info), PHONE_MENU)
+    else:
+        send_message(chat_id, output or "Логин/пароль обновлены.", PHONE_MENU)
 
 
 def app_files():
@@ -637,10 +699,15 @@ def handle_callback(callback):
 
     if data == "create":
         handle_create(chat_id, tg_id)
+    elif data == "cancel":
+        cancel_pending(chat_id, tg_id)
     elif data == "refresh":
+        PENDING_ACTIONS.pop(str(tg_id), None)
         show_entry_menu(chat_id, tg_id)
     elif data == "install":
         show_app_store(chat_id)
+    elif data == "change_password":
+        ask_password_change(chat_id, tg_id)
     elif data.startswith("app:"):
         handle_app_install(chat_id, tg_id, data)
     elif data == "delete_confirm":
@@ -663,7 +730,16 @@ def handle_message(message):
         handle_document(chat_id, tg_id, message)
         return
 
+    pending = PENDING_ACTIONS.get(str(tg_id))
+    if pending and pending.get("action") == "change_password":
+        if text in {"/cancel", "cancel", "отмена"}:
+            cancel_pending(chat_id, tg_id)
+        else:
+            handle_password_message(chat_id, tg_id, text)
+        return
+
     if text in {"/start", "/menu", "menu", "меню"}:
+        PENDING_ACTIONS.pop(str(tg_id), None)
         show_entry_menu(chat_id, tg_id)
     else:
         send_message(chat_id, "Открой меню командой /start.")

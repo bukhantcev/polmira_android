@@ -2998,6 +2998,35 @@ bot_install_app() {
     install_app_file_to_phone_dir "$phone_dir" "$app_real"
 }
 
+bot_set_password() {
+    need_root
+    create_dirs
+
+    local phone_dir new_user new_pass
+    phone_dir=$(bot_phone_dir_or_fail "${1:-}") || return 1
+    new_user="${2:-}"
+    new_pass="${3:-}"
+
+    if [[ ! "$new_user" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then
+        say_red "BAD_USERNAME"
+        return 1
+    fi
+
+    if [ "${#new_pass}" -lt 4 ]; then
+        say_red "BAD_PASSWORD"
+        return 1
+    fi
+
+    set_phone_password_files "$phone_dir" "$new_user" "$new_pass"
+    phone_env_set "$phone_dir" "USERNAME" "$new_user"
+
+    nginx -t
+    systemctl reload nginx
+
+    say_green "Логин/пароль noVNC обновлены"
+    bot_phone_info_by_dir "$phone_dir"
+}
+
 cli_dispatch() {
     local command="${1:-}"
 
@@ -3010,6 +3039,7 @@ cli_dispatch() {
         bot-enable-vpn) shift; bot_enable_vpn "$@" ;;
         bot-disable-vpn) shift; bot_disable_vpn "$@" ;;
         bot-install-app) shift; bot_install_app "$@" ;;
+        bot-set-password) shift; bot_set_password "$@" ;;
         *) return 1 ;;
     esac
 }
