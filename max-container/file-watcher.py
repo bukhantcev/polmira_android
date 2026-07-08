@@ -18,11 +18,11 @@ SCAN_INTERVAL = float(os.environ.get("POLMIRA_FILE_WATCH_INTERVAL", "2"))
 STABLE_SECONDS = float(os.environ.get("POLMIRA_FILE_STABLE_SECONDS", "3"))
 MAX_FILE_BYTES = int(os.environ.get("POLMIRA_FILE_MAX_BYTES", str(49 * 1024 * 1024)))
 FORCE_IPV4 = os.environ.get("TELEGRAM_FORCE_IPV4", "yes").lower() in {"1", "yes", "true", "on"}
+WATCH_INTERNAL_FILES = os.environ.get("POLMIRA_WATCH_INTERNAL_FILES", "no").lower() in {"1", "yes", "true", "on"}
 
-ROOTS = [
-    Path("/home/polmira/Downloads"),
-    Path("/home/polmira/.local/share/ONEME"),
-]
+ROOTS = [Path("/home/polmira/Downloads")]
+if WATCH_INTERNAL_FILES:
+    ROOTS.append(Path("/home/polmira/.local/share/ONEME"))
 
 EXCLUDED_PARTS = {
     ".crash_dumps",

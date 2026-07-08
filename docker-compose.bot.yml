@@ -9,7 +9,7 @@ services:
     network_mode: host
     pid: host
     env_file:
-      - ./bot/.env
+      - /opt/polmira-docker/bot/.env
     environment:
       POLMIRA_BOT_ENV: /opt/polmira-docker/bot/.env
       POLMIRA_CMD: /app/host-polmira

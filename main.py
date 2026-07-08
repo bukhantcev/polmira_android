@@ -3,6 +3,8 @@ import json
 import mimetypes
 import os
 import re
+import socket
+import struct
 import subprocess
 import tempfile
 import threading
@@ -48,10 +50,90 @@ POLMIRA_RELAY_SECRET = os.environ.get("POLMIRA_RELAY_SECRET", "")
 POLMIRA_RELAY_BIND = os.environ.get("POLMIRA_RELAY_BIND", "172.17.0.1")
 POLMIRA_RELAY_PORT = int(os.environ.get("POLMIRA_RELAY_PORT", "8788"))
 TELEGRAM_API_RETRIES = int(os.environ.get("TELEGRAM_API_RETRIES", "3"))
+TELEGRAM_SEND_TIMEOUT = int(os.environ.get("TELEGRAM_SEND_TIMEOUT", "12"))
 PENDING_ACTIONS = {}
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 LOCAL_POLMIRA = SCRIPT_DIR / "polmira-docker.sh"
+
+
+def install_socks5_proxy(proxy_url):
+    parsed = urllib.parse.urlparse(proxy_url)
+
+    if parsed.scheme not in {"socks5", "socks5h"}:
+        return False
+
+    proxy_host = parsed.hostname or "127.0.0.1"
+    proxy_port = parsed.port or 1080
+    original_create_connection = socket.create_connection
+
+    def recv_exact(sock, size):
+        data = b""
+
+        while len(data) < size:
+            chunk = sock.recv(size - len(data))
+            if not chunk:
+                raise OSError("SOCKS5 proxy closed connection")
+            data += chunk
+
+        return data
+
+    def socks_create_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
+        host, port = address
+
+        if host == proxy_host and port == proxy_port:
+            return original_create_connection(address, timeout, source_address)
+
+        sock = original_create_connection((proxy_host, proxy_port), timeout, source_address)
+
+        try:
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                sock.settimeout(timeout)
+
+            sock.sendall(b"\x05\x01\x00")
+            version, method = recv_exact(sock, 2)
+
+            if version != 5 or method != 0:
+                raise OSError("SOCKS5 proxy rejected no-auth handshake")
+
+            host_bytes = str(host).encode("idna")
+
+            if len(host_bytes) > 255:
+                raise OSError("SOCKS5 hostname is too long")
+
+            request = (
+                b"\x05\x01\x00\x03"
+                + bytes([len(host_bytes)])
+                + host_bytes
+                + struct.pack("!H", int(port))
+            )
+            sock.sendall(request)
+
+            header = recv_exact(sock, 4)
+
+            if header[0] != 5 or header[1] != 0:
+                raise OSError(f"SOCKS5 connect failed, code={header[1]}")
+
+            atyp = header[3]
+
+            if atyp == 1:
+                recv_exact(sock, 4)
+            elif atyp == 3:
+                length = recv_exact(sock, 1)[0]
+                recv_exact(sock, length)
+            elif atyp == 4:
+                recv_exact(sock, 16)
+            else:
+                raise OSError(f"SOCKS5 unknown address type={atyp}")
+
+            recv_exact(sock, 2)
+            return sock
+        except Exception:
+            sock.close()
+            raise
+
+    socket.create_connection = socks_create_connection
+    return True
 
 
 def allowed_files():
@@ -141,7 +223,10 @@ def is_valid_relay_secret(tg_id, secret):
 
     return str(secret or "") == expected
 
-if TELEGRAM_PROXY:
+if TELEGRAM_PROXY and install_socks5_proxy(TELEGRAM_PROXY):
+    opener = urllib.request.build_opener()
+    urllib.request.install_opener(opener)
+elif TELEGRAM_PROXY:
     proxy_handler = urllib.request.ProxyHandler({
         "http": TELEGRAM_PROXY,
         "https": TELEGRAM_PROXY,
@@ -176,7 +261,7 @@ DELETE_CONFIRM_MENU = {
     ]
 }
 
-def api(method, payload=None):
+def api(method, payload=None, timeout=None, retries=None):
     if not BOT_TOKEN:
         raise RuntimeError("Укажи TELEGRAM_BOT_TOKEN")
 
@@ -190,16 +275,19 @@ def api(method, payload=None):
 
     last_exc = None
 
-    for attempt in range(1, TELEGRAM_API_RETRIES + 1):
+    request_timeout = timeout if timeout is not None else POLL_TIMEOUT + 10
+    request_retries = retries if retries is not None else TELEGRAM_API_RETRIES
+
+    for attempt in range(1, request_retries + 1):
         req = urllib.request.Request(url, data=data, headers=headers)
 
         try:
-            with urllib.request.urlopen(req, timeout=POLL_TIMEOUT + 10) as resp:
+            with urllib.request.urlopen(req, timeout=request_timeout) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
             break
         except (TimeoutError, urllib.error.URLError) as exc:
             last_exc = exc
-            if attempt >= TELEGRAM_API_RETRIES:
+            if attempt >= request_retries:
                 raise
             time.sleep(min(2 * attempt, 5))
     else:
@@ -226,7 +314,7 @@ def send_message(chat_id, text, reply_markup=None):
     if reply_markup:
         payload["reply_markup"] = reply_markup
 
-    return api("sendMessage", payload)
+    return api("sendMessage", payload, timeout=TELEGRAM_SEND_TIMEOUT)
 
 
 def safe_send_message(chat_id, text, reply_markup=None):
@@ -658,8 +746,6 @@ def complete_change_credentials(chat_id, tg_id, text):
 
 
 def handle_delete(chat_id, tg_id):
-    safe_send_message(chat_id, "Удаляю MAX-контейнер...")
-
     try:
         output = run_polmira("bot-delete-phone", str(tg_id))
     except RuntimeError as exc:
