@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 import json
-import hashlib
 import mimetypes
 import os
 import re
-import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import tempfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
@@ -35,24 +34,112 @@ def load_env_file(path):
             os.environ[key] = value
 
 
-load_env_file(os.environ.get("POLMIRA_BOT_ENV", "/opt/polmira/bot/.env"))
+load_env_file(os.environ.get("POLMIRA_BOT_ENV", "/opt/polmira-docker/bot/.env"))
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-POLMIRA_CMD = os.environ.get("POLMIRA_CMD", "/usr/local/bin/polmira")
-APP_DIR = Path(os.environ.get("POLMIRA_APP_DIR", "/opt/polmira"))
+POLMIRA_CMD = os.environ.get("POLMIRA_CMD", "/usr/local/bin/polmira-docker")
+APP_DIR = Path(os.environ.get("POLMIRA_APP_DIR", "/opt/polmira-docker"))
 APPS_DIR = APP_DIR / "apps"
-PHONES_DIR = APP_DIR / "phones"
+PHONES_DIR = APP_DIR / "instances"
 BOT_DIR = APP_DIR / "bot"
-SENT_FILES_STATE = BOT_DIR / "sent-files.json"
 POLL_TIMEOUT = int(os.environ.get("TELEGRAM_POLL_TIMEOUT", "30"))
 TELEGRAM_PROXY = os.environ.get("TELEGRAM_PROXY", "")
-MAX_DOWNLOAD_PROXY = os.environ.get("MAX_DOWNLOAD_PROXY", TELEGRAM_PROXY)
-MAX_WATCH_INTERVAL = int(os.environ.get("MAX_WATCH_INTERVAL", "10"))
-MAX_LOG_LOOKBACK = int(os.environ.get("MAX_LOG_LOOKBACK", "1800"))
+POLMIRA_RELAY_SECRET = os.environ.get("POLMIRA_RELAY_SECRET", "")
+POLMIRA_RELAY_BIND = os.environ.get("POLMIRA_RELAY_BIND", "172.17.0.1")
+POLMIRA_RELAY_PORT = int(os.environ.get("POLMIRA_RELAY_PORT", "8788"))
+TELEGRAM_API_RETRIES = int(os.environ.get("TELEGRAM_API_RETRIES", "3"))
 PENDING_ACTIONS = {}
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-LOCAL_POLMIRA = SCRIPT_DIR / "polmira1.sh"
+LOCAL_POLMIRA = SCRIPT_DIR / "polmira-docker.sh"
+
+
+def allowed_files():
+    configured = os.environ.get("POLMIRA_ALLOWED_FILE", "")
+    candidates = [
+        Path(configured) if configured else None,
+        APP_DIR / "tg-allowed.txt",
+        Path("/opt/polmira-docker/tg-allowed.txt"),
+        Path("/opt/polmira-linux/tg-allowed.txt"),
+        Path("/opt/polmira/tg-allowed.txt"),
+    ]
+    seen = set()
+
+    for path in candidates:
+        if not path:
+            continue
+        resolved = str(path)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        yield path
+
+
+def is_allowed_tg(tg_id):
+    wanted = str(tg_id or "").strip()
+    if not wanted:
+        return False
+
+    for path in allowed_files():
+        try:
+            for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = raw_line.strip()
+                if line and not line.startswith("#") and line == wanted:
+                    return True
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            print(f"Could not read allowed file {path}: {exc}")
+
+    return False
+
+
+def deny_access(chat_id, tg_id):
+    send_message(chat_id, f"ACCESS_DENIED\nТвой Telegram ID: {tg_id}")
+
+
+def read_env_file(path):
+    data = {}
+
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except FileNotFoundError:
+        return data
+    except OSError as exc:
+        print(f"Could not read env file {path}: {exc}")
+        return data
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        data[key.strip()] = value.strip()
+
+    return data
+
+
+def instance_env_for_tg(tg_id):
+    wanted = str(tg_id or "").strip()
+    if not wanted:
+        return {}
+
+    for env_file in PHONES_DIR.glob("*/instance.env"):
+        data = read_env_file(env_file)
+        if data.get("TG_ID") == wanted:
+            return data
+
+    return {}
+
+
+def is_valid_relay_secret(tg_id, secret):
+    data = instance_env_for_tg(tg_id)
+    expected = data.get("RELAY_SECRET", "")
+
+    if not expected:
+        return False
+
+    return str(secret or "") == expected
 
 if TELEGRAM_PROXY:
     proxy_handler = urllib.request.ProxyHandler({
@@ -69,22 +156,17 @@ PHONE_MENU = {
             {"text": "Выключить", "callback_data": "stop"},
         ],
         [
-            {"text": "Установить приложение", "callback_data": "install"},
-            {"text": "Включить VPN", "callback_data": "vpn_on"},
+            {"text": "Сменить логин/пароль", "callback_data": "change_credentials"},
         ],
         [
-            {"text": "Выключить VPN", "callback_data": "vpn_off"},
-            {"text": "Сменить логин/пароль", "callback_data": "change_password"},
-        ],
-        [
-            {"text": "Удалить телефон", "callback_data": "delete_confirm"},
+            {"text": "Удалить", "callback_data": "delete_confirm"},
         ],
         [{"text": "Обновить статус", "callback_data": "refresh"}],
     ]
 }
 
 CREATE_MENU = {
-    "inline_keyboard": [[{"text": "Создать телефон", "callback_data": "create"}]]
+    "inline_keyboard": [[{"text": "Создать MAX-контейнер", "callback_data": "create"}]]
 }
 
 DELETE_CONFIRM_MENU = {
@@ -93,11 +175,6 @@ DELETE_CONFIRM_MENU = {
         [{"text": "Отмена", "callback_data": "refresh"}],
     ]
 }
-
-PENDING_MENU = {
-    "inline_keyboard": [[{"text": "Отмена", "callback_data": "cancel"}]]
-}
-
 
 def api(method, payload=None):
     if not BOT_TOKEN:
@@ -111,10 +188,22 @@ def api(method, payload=None):
         data = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
 
-    req = urllib.request.Request(url, data=data, headers=headers)
+    last_exc = None
 
-    with urllib.request.urlopen(req, timeout=POLL_TIMEOUT + 10) as resp:
-        body = json.loads(resp.read().decode("utf-8"))
+    for attempt in range(1, TELEGRAM_API_RETRIES + 1):
+        req = urllib.request.Request(url, data=data, headers=headers)
+
+        try:
+            with urllib.request.urlopen(req, timeout=POLL_TIMEOUT + 10) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            break
+        except (TimeoutError, urllib.error.URLError) as exc:
+            last_exc = exc
+            if attempt >= TELEGRAM_API_RETRIES:
+                raise
+            time.sleep(min(2 * attempt, 5))
+    else:
+        raise last_exc or RuntimeError("Telegram API failed")
 
     if not body.get("ok"):
         raise RuntimeError(body)
@@ -140,6 +229,176 @@ def send_message(chat_id, text, reply_markup=None):
     return api("sendMessage", payload)
 
 
+def safe_send_message(chat_id, text, reply_markup=None):
+    try:
+        return send_message(chat_id, text, reply_markup)
+    except Exception as exc:
+        print(f"sendMessage failed: {exc}", flush=True)
+        return None
+
+
+def relay_file_headers(handler):
+    tg_id = str(handler.headers.get("X-Polmira-Tg-Id") or "").strip()
+    secret = str(handler.headers.get("X-Polmira-Secret") or "")
+    filename = sanitize_filename(urllib.parse.unquote(handler.headers.get("X-Polmira-Filename") or "max-file"))
+    caption = urllib.parse.unquote(handler.headers.get("X-Polmira-Caption") or "")
+    mime_type = str(handler.headers.get("Content-Type") or "application/octet-stream").split(";", 1)[0]
+    return tg_id, secret, filename, caption, mime_type
+
+
+def send_telegram_file(chat_id, path, filename, caption, mime_type):
+    method = "sendDocument"
+    field = "document"
+
+    if mime_type.startswith("image/") and Path(path).stat().st_size <= 10 * 1024 * 1024:
+        method = "sendPhoto"
+        field = "photo"
+
+    fields = {"chat_id": chat_id}
+    if caption:
+        fields["caption"] = caption[:1024]
+
+    return multipart_api(method, fields, {field: (path, filename, mime_type)})
+
+
+def send_message_async(chat_id, text):
+    def worker():
+        try:
+            send_message(chat_id, text)
+        except Exception as exc:
+            print(f"Relay async message error: {exc}", flush=True)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def send_file_async(chat_id, path, filename, caption, mime_type):
+    def worker():
+        try:
+            send_telegram_file(chat_id, path, filename, caption, mime_type)
+        except Exception as exc:
+            print(f"Relay async file error: {exc}", flush=True)
+        finally:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+class RelayHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        return
+
+    def do_POST(self):
+        if self.path == "/notify":
+            self.handle_notify()
+            return
+
+        if self.path == "/file":
+            self.handle_file()
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def handle_notify(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+
+            tg_id = str(payload.get("tg_id") or "").strip()
+            text = str(payload.get("text") or "").strip()
+            secret = str(payload.get("secret") or "")
+
+            if not tg_id or not text:
+                self.send_response(400)
+                self.end_headers()
+                return
+
+            if not is_allowed_tg(tg_id) or not is_valid_relay_secret(tg_id, secret):
+                self.send_response(403)
+                self.end_headers()
+                return
+
+            send_message_async(tg_id, text)
+            self.send_response(204)
+            self.end_headers()
+        except Exception as exc:
+            print(f"Relay error: {exc}")
+            self.send_response(500)
+            self.end_headers()
+
+    def handle_file(self):
+        tmp_path = None
+
+        try:
+            tg_id, secret, filename, caption, mime_type = relay_file_headers(self)
+            length = int(self.headers.get("Content-Length", "0"))
+            max_size = int(os.environ.get("POLMIRA_RELAY_MAX_FILE_BYTES", str(49 * 1024 * 1024)))
+
+            if not tg_id or not filename or length <= 0:
+                self.send_response(400)
+                self.end_headers()
+                return
+
+            if length > max_size:
+                self.send_response(413)
+                self.end_headers()
+                return
+
+            if not is_allowed_tg(tg_id) or not is_valid_relay_secret(tg_id, secret):
+                self.send_response(403)
+                self.end_headers()
+                return
+
+            suffix = Path(filename).suffix
+            with tempfile.NamedTemporaryFile(prefix="polmira-relay-", suffix=suffix, delete=False) as tmp:
+                tmp_path = Path(tmp.name)
+                remaining = length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    tmp.write(chunk)
+                    remaining -= len(chunk)
+
+            if remaining != 0:
+                self.send_response(400)
+                self.end_headers()
+                return
+
+            send_file_async(tg_id, tmp_path, filename, caption, mime_type)
+            tmp_path = None
+            self.send_response(204)
+            self.end_headers()
+        except Exception as exc:
+            print(f"Relay file error: {exc}")
+            self.send_response(500)
+            self.end_headers()
+        finally:
+            if tmp_path:
+                try:
+                    Path(tmp_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+def start_relay_server():
+    if not POLMIRA_RELAY_SECRET:
+        print("Polmira relay disabled: POLMIRA_RELAY_SECRET is empty")
+        return
+
+    try:
+        server = ThreadingHTTPServer((POLMIRA_RELAY_BIND, POLMIRA_RELAY_PORT), RelayHandler)
+    except OSError as exc:
+        print(f"Polmira relay not started: {exc}")
+        return
+
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"Polmira relay listening on {POLMIRA_RELAY_BIND}:{POLMIRA_RELAY_PORT}")
+
+
 def answer_callback(callback_id, text=""):
     payload = {"callback_query_id": callback_id}
 
@@ -147,6 +406,14 @@ def answer_callback(callback_id, text=""):
         payload["text"] = text[:180]
 
     return api("answerCallbackQuery", payload)
+
+
+def safe_answer_callback(callback_id, text=""):
+    try:
+        return answer_callback(callback_id, text)
+    except Exception as exc:
+        print(f"answerCallbackQuery failed: {exc}", flush=True)
+        return None
 
 
 def multipart_api(method, fields, files):
@@ -162,12 +429,18 @@ def multipart_api(method, fields, files):
         body.extend(str(value).encode("utf-8"))
         body.extend(b"\r\n")
 
-    for name, path in files.items():
+    for name, value in files.items():
+        if isinstance(value, tuple):
+            path, upload_name, upload_mime_type = value
+        else:
+            path, upload_name, upload_mime_type = value, None, None
+
         file_path = Path(path)
-        mime_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+        file_name = sanitize_filename(upload_name or file_path.name)
+        mime_type = upload_mime_type or mimetypes.guess_type(file_name)[0] or "application/octet-stream"
         body.extend(f"--{boundary}\r\n".encode())
         body.extend(
-            f'Content-Disposition: form-data; name="{name}"; filename="{file_path.name}"\r\n'.encode()
+            f'Content-Disposition: form-data; name="{name}"; filename="{file_name}"\r\n'.encode()
         )
         body.extend(f"Content-Type: {mime_type}\r\n\r\n".encode())
         body.extend(file_path.read_bytes())
@@ -175,14 +448,26 @@ def multipart_api(method, fields, files):
 
     body.extend(f"--{boundary}--\r\n".encode())
 
-    req = urllib.request.Request(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
-        data=bytes(body),
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-    )
+    last_exc = None
 
-    with urllib.request.urlopen(req, timeout=180) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
+    for attempt in range(1, TELEGRAM_API_RETRIES + 1):
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+            data=bytes(body),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            break
+        except (TimeoutError, urllib.error.URLError) as exc:
+            last_exc = exc
+            if attempt >= TELEGRAM_API_RETRIES:
+                raise
+            time.sleep(min(2 * attempt, 5))
+    else:
+        raise last_exc or RuntimeError("Telegram multipart API failed")
 
     if not payload.get("ok"):
         raise RuntimeError(payload)
@@ -249,8 +534,8 @@ def status_for_user(tg_id):
 
 def render_phone_status(info):
     lines = [
-        "Твой телефон готов.",
-        f"Имя: {info.get('PHONE_NAME', '-')}",
+        "Твой MAX-контейнер готов.",
+        f"Контейнер: {info.get('CONTAINER_NAME') or info.get('PHONE_NAME', '-')}",
         f"Логин: {info.get('USERNAME', '-')}",
     ]
 
@@ -258,8 +543,7 @@ def render_phone_status(info):
         lines.append(f"Пароль: {info['PASSWORD']}")
 
     lines.extend([
-        f"VPN: {info.get('VPN_ENABLED', 'no')}",
-        f"init: {info.get('INIT_STATUS', '-')}",
+        f"Статус: {info.get('INIT_STATUS', '-')}",
         f"web: {info.get('WEB_STATUS', '-')} / ready: {info.get('WEB_READY', '-')}",
         "",
         "Ссылка:",
@@ -283,18 +567,18 @@ def show_entry_menu(chat_id, tg_id):
         return
 
     if info.get("NO_PHONE") == "1":
-        send_message(chat_id, "Доступ есть. Телефон ещё не создан.", CREATE_MENU)
+        send_message(chat_id, "Доступ есть. MAX-контейнер ещё не создан.", CREATE_MENU)
     else:
         send_message(chat_id, render_phone_status(info), PHONE_MENU)
 
 
 def handle_create(chat_id, tg_id):
-    send_message(chat_id, "Создаю телефон. Первый запуск может занять несколько минут...")
+    safe_send_message(chat_id, "Создаю MAX-контейнер. Первый запуск может занять несколько минут...")
 
     try:
         output = run_polmira("bot-create-phone", str(tg_id))
     except RuntimeError as exc:
-        send_message(chat_id, f"Не получилось создать телефон:\n{exc}")
+        send_message(chat_id, f"Не получилось создать MAX-контейнер:\n{exc}")
         return
 
     info = parse_env_output(output)
@@ -308,14 +592,16 @@ def handle_create(chat_id, tg_id):
 
 def handle_action(chat_id, tg_id, action):
     mapping = {
-        "start": ("bot-start-phone", "Запускаю телефон..."),
-        "stop": ("bot-stop-phone", "Выключаю телефон..."),
-        "vpn_on": ("bot-enable-vpn", "Включаю VPN..."),
-        "vpn_off": ("bot-disable-vpn", "Выключаю VPN..."),
+        "start": ("bot-start-phone", "Запускаю сессию..."),
+        "stop": ("bot-stop-phone", "Выключаю сессию..."),
     }
 
+    if action not in mapping:
+        send_message(chat_id, "Эта команда больше не используется. Открой меню заново: /start")
+        return
+
     command, progress = mapping[action]
-    send_message(chat_id, progress)
+    safe_send_message(chat_id, progress)
 
     try:
         output = run_polmira(command, str(tg_id))
@@ -331,122 +617,61 @@ def handle_action(chat_id, tg_id, action):
         send_message(chat_id, output or "Готово.", PHONE_MENU)
 
 
+def handle_change_credentials(chat_id, tg_id):
+    PENDING_ACTIONS[str(tg_id)] = {"action": "change_credentials"}
+    send_message(
+        chat_id,
+        "Пришли новый логин и пароль одной строкой:\n\nлогин пароль\n\n"
+        "Логин: латиница/цифры/точка/дефис/подчёркивание, до 64 символов.",
+        {"inline_keyboard": [[{"text": "Отмена", "callback_data": "cancel"}]]},
+    )
+
+
+def complete_change_credentials(chat_id, tg_id, text):
+    parts = text.split(maxsplit=1)
+
+    if len(parts) != 2:
+        send_message(chat_id, "Нужно одной строкой: логин пароль", PHONE_MENU)
+        return
+
+    username, password = parts[0].strip(), parts[1].strip()
+
+    if not re.match(r"^[A-Za-z0-9_.-]{1,64}$", username):
+        send_message(chat_id, "Логин должен быть: A-Z, a-z, 0-9, точка, дефис или подчёркивание.", PHONE_MENU)
+        return
+
+    if len(password) < 4:
+        send_message(chat_id, "Пароль слишком короткий, дай хотя бы 4 символа.", PHONE_MENU)
+        return
+
+    try:
+        output = run_polmira("bot-set-password", str(tg_id), username, password)
+    except RuntimeError as exc:
+        PENDING_ACTIONS.pop(str(tg_id), None)
+        send_message(chat_id, f"Не получилось сменить логин/пароль:\n{exc}", PHONE_MENU)
+        return
+
+    PENDING_ACTIONS.pop(str(tg_id), None)
+    info = parse_env_output(output)
+    info["PASSWORD"] = password
+    send_message(chat_id, render_phone_status(info), PHONE_MENU)
+
+
 def handle_delete(chat_id, tg_id):
-    send_message(chat_id, "Удаляю телефон...")
+    safe_send_message(chat_id, "Удаляю MAX-контейнер...")
 
     try:
         output = run_polmira("bot-delete-phone", str(tg_id))
     except RuntimeError as exc:
-        send_message(chat_id, f"Не получилось удалить телефон:\n{exc}")
+        send_message(chat_id, f"Не получилось удалить MAX-контейнер:\n{exc}")
         return
 
-    send_message(chat_id, output or "Телефон удалён.", CREATE_MENU)
-
-
-def ask_password_change(chat_id, tg_id):
-    PENDING_ACTIONS[str(tg_id)] = {
-        "action": "change_password",
-        "created_at": time.time(),
-    }
-    send_message(
-        chat_id,
-        "Отправь новый логин и пароль одной строкой:\n"
-        "login password\n\n"
-        "Логин: латиница/цифры/._-, до 64 символов.\n"
-        "Пароль: минимум 4 символа.",
-        PENDING_MENU,
-    )
+    safe_send_message(chat_id, output or "MAX-контейнер удалён.", CREATE_MENU)
 
 
 def cancel_pending(chat_id, tg_id):
     PENDING_ACTIONS.pop(str(tg_id), None)
     send_message(chat_id, "Отменено.", PHONE_MENU)
-
-
-def handle_password_message(chat_id, tg_id, text):
-    parts = text.strip().split(maxsplit=1)
-
-    if len(parts) != 2:
-        send_message(chat_id, "Нужно одной строкой: login password", PENDING_MENU)
-        return
-
-    username, password = parts
-
-    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", username):
-        send_message(chat_id, "Логин только латиница/цифры/._-, до 64 символов.", PENDING_MENU)
-        return
-
-    if len(password) < 4:
-        send_message(chat_id, "Пароль слишком короткий, минимум 4 символа.", PENDING_MENU)
-        return
-
-    PENDING_ACTIONS.pop(str(tg_id), None)
-    send_message(chat_id, "Меняю логин и пароль noVNC...")
-
-    try:
-        output = run_polmira("bot-set-password", str(tg_id), username, password)
-    except RuntimeError as exc:
-        send_message(chat_id, f"Не получилось сменить логин/пароль:\n{exc}", PHONE_MENU)
-        return
-
-    info = parse_env_output(output)
-
-    if info:
-        send_message(chat_id, render_phone_status(info), PHONE_MENU)
-    else:
-        send_message(chat_id, output or "Логин/пароль обновлены.", PHONE_MENU)
-
-
-def app_files():
-    APPS_DIR.mkdir(parents=True, exist_ok=True)
-    allowed = {".apk", ".apks", ".xapk", ".apkm", ".zip"}
-    return sorted(
-        [path for path in APPS_DIR.iterdir() if path.is_file() and path.suffix.lower() in allowed],
-        key=lambda path: path.name.lower(),
-    )
-
-
-def show_app_store(chat_id):
-    files = app_files()
-
-    if not files:
-        send_message(chat_id, "В store пока нет приложений. Положи APK/APKS/XAPK/APKM/ZIP в /opt/polmira/apps.")
-        return
-
-    keyboard = []
-
-    for index, path in enumerate(files[:40]):
-        keyboard.append([{"text": path.name[:60], "callback_data": f"app:{index}"}])
-
-    keyboard.append([{"text": "Обновить список", "callback_data": "install"}])
-    keyboard.append([{"text": "Назад", "callback_data": "refresh"}])
-
-    send_message(chat_id, "Выбери приложение из /opt/polmira/apps:", {"inline_keyboard": keyboard})
-
-
-def handle_app_install(chat_id, tg_id, data):
-    try:
-        index = int(data.split(":", 1)[1])
-    except (IndexError, ValueError):
-        send_message(chat_id, "Не понял выбранное приложение.", PHONE_MENU)
-        return
-
-    files = app_files()
-
-    if index < 0 or index >= len(files):
-        send_message(chat_id, "Список приложений изменился. Открой store заново.", PHONE_MENU)
-        return
-
-    app_path = files[index]
-    send_message(chat_id, f"Устанавливаю {app_path.name}...")
-
-    try:
-        output = run_polmira("bot-install-app", str(tg_id), str(app_path))
-    except RuntimeError as exc:
-        send_message(chat_id, f"Не получилось установить приложение:\n{exc}", PHONE_MENU)
-        return
-
-    send_message(chat_id, output or "Приложение установлено.", PHONE_MENU)
 
 
 def phone_dir_for_tg_id(tg_id):
@@ -456,7 +681,7 @@ def phone_dir_for_tg_id(tg_id):
         if not phone_dir.is_dir():
             continue
 
-        env = read_phone_env(phone_dir / "phone.env")
+        env = read_phone_env(phone_dir / "instance.env")
 
         if env.get("TG_ID") == wanted:
             return phone_dir
@@ -540,38 +765,22 @@ def download_telegram_file(file_id):
     return data, file_path
 
 
-def fix_android_media_permissions(path):
-    try:
-        os.chown(path, 1023, 1023)
-    except PermissionError:
-        pass
-    except OSError:
-        pass
-
-    try:
-        if path.is_dir():
-            path.chmod(0o775)
-        else:
-            path.chmod(0o644)
-    except OSError:
-        pass
-
-
 def save_message_file_to_phone(tg_id, message):
     phone_dir = phone_dir_for_tg_id(tg_id)
 
     if phone_dir is None:
-        raise RuntimeError("Телефон для этого Telegram ID не найден")
+        raise RuntimeError("MAX-контейнер для этого Telegram ID не найден")
 
+    env = read_phone_env(phone_dir / "instance.env")
     file_id, original_name, kind, mime_type = media_from_message(message)
 
     if not file_id:
         raise RuntimeError("Не нашёл файл в сообщении")
 
     data, telegram_path = download_telegram_file(file_id)
-    max_dir = phone_dir / "data" / "media" / "0" / "Download" / "MAX"
+    max_dir = Path(env.get("DOWNLOADS_DIR") or phone_dir / "downloads")
+
     max_dir.mkdir(parents=True, exist_ok=True)
-    fix_android_media_permissions(max_dir)
 
     if original_name:
         filename = sanitize_filename(original_name)
@@ -581,7 +790,7 @@ def save_message_file_to_phone(tg_id, message):
 
     destination = unique_path(max_dir / filename)
     destination.write_bytes(data)
-    fix_android_media_permissions(destination)
+    os.chmod(destination, 0o666)
     return destination
 
 
@@ -592,7 +801,7 @@ def handle_file_message(chat_id, tg_id, message):
         send_message(chat_id, f"Не получилось сохранить файл:\n{exc}", PHONE_MENU)
         return
 
-    send_message(chat_id, f"Сохранил в MAX:\n{path.name}", PHONE_MENU)
+    send_message(chat_id, f"Сохранил в Downloads:\n{path.name}", PHONE_MENU)
 
 
 def read_phone_env(path):
@@ -609,234 +818,19 @@ def read_phone_env(path):
     return data
 
 
-def load_sent_state():
-    if not SENT_FILES_STATE.exists():
-        return {}
-
-    try:
-        return json.loads(SENT_FILES_STATE.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {}
-
-
-def save_sent_state(state):
-    BOT_DIR.mkdir(parents=True, exist_ok=True)
-    SENT_FILES_STATE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def file_is_stable(path):
-    try:
-        first = path.stat()
-        time.sleep(1)
-        second = path.stat()
-    except FileNotFoundError:
-        return False
-
-    return first.st_size == second.st_size and second.st_size > 0
-
-
-def send_document(chat_id, path, caption):
-    return multipart_api(
-        "sendDocument",
-        {"chat_id": chat_id, "caption": caption[:1024]},
-        {"document": path},
-    )
-
-
-def tail_text(path, max_bytes=2_000_000):
-    try:
-        with path.open("rb") as fh:
-            size = path.stat().st_size
-            if size > max_bytes:
-                fh.seek(size - max_bytes)
-            return fh.read().decode("utf-8", errors="ignore")
-    except OSError:
-        return ""
-
-
-def max_log_urls(phone_dir):
-    logs_dir = phone_dir / "data" / "data" / "ru.oneme.app" / "logs"
-
-    if not logs_dir.exists():
-        return []
-
-    urls = []
-    seen = set()
-
-    cutoff = time.time() - MAX_LOG_LOOKBACK
-
-    for log_path in sorted(logs_dir.glob("*.log"), key=lambda path: path.stat().st_mtime, reverse=True)[:3]:
-        if log_path.stat().st_mtime < cutoff:
-            continue
-
-        text = tail_text(log_path)
-
-        for raw_url in re.findall(r"https://fd\.oneme\.ru/getfile\?[^ \n\r\t'\"<>]+", text):
-            url = raw_url.replace("\\u0026", "&").rstrip(".,;)]}\"'")
-
-            if url not in seen:
-                seen.add(url)
-                urls.append(url)
-
-    return urls
-
-
-def max_url_key(phone_name, url):
-    parsed = urllib.parse.urlparse(url)
-    params = urllib.parse.parse_qs(parsed.query)
-    file_id = (params.get("id") or [""])[0]
-    user_id = (params.get("userId") or [""])[0]
-
-    if file_id:
-        return f"max-url:{phone_name}:{user_id}:{file_id}"
-
-    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
-    return f"max-url:{phone_name}:{digest}"
-
-
-def extension_from_download(name, content_type, data):
-    suffix = Path(name).suffix
-
-    if suffix:
-        return ""
-
-    mime_ext = {
-        "image/webp": ".webp",
-        "image/jpeg": ".jpg",
-        "image/png": ".png",
-        "image/gif": ".gif",
-        "application/pdf": ".pdf",
-        "application/zip": ".zip",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
-    }.get((content_type or "").split(";", 1)[0].lower())
-
-    if mime_ext:
-        return mime_ext
-
-    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
-        return ".webp"
-    if data.startswith(b"\xff\xd8\xff"):
-        return ".jpg"
-    if data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return ".png"
-    if data.startswith(b"%PDF"):
-        return ".pdf"
-    if data.startswith(b"PK\x03\x04"):
-        return ".zip"
-
-    return ".bin"
-
-
-def filename_from_response(url, headers, data):
-    disposition = headers.get("Content-Disposition", "")
-    match = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', disposition)
-
-    if match:
-        filename = urllib.parse.unquote(match.group(1)).strip()
-    else:
-        parsed = urllib.parse.urlparse(url)
-        params = urllib.parse.parse_qs(parsed.query)
-        file_id = (params.get("id") or ["file"])[0]
-        filename = f"max_{time.strftime('%Y-%m-%d_%H-%M-%S')}_{file_id}"
-
-    filename = re.sub(r'[\\/:*?"<>|\r\n]+', "_", filename).strip("._ ") or "max_file"
-    return filename + extension_from_download(filename, headers.get_content_type(), data)
-
-
-def download_max_url(url):
-    opener = urllib.request.build_opener()
-
-    if MAX_DOWNLOAD_PROXY:
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({
-            "http": MAX_DOWNLOAD_PROXY,
-            "https": MAX_DOWNLOAD_PROXY,
-        }))
-
-    req = urllib.request.Request(url, headers={"User-Agent": "PolmiraBot/1.0"})
-
-    BOT_DIR.mkdir(parents=True, exist_ok=True)
-
-    with opener.open(req, timeout=120) as resp:
-        data = resp.read()
-        filename = filename_from_response(url, resp.headers, data)
-
-    temp_dir = Path(tempfile.mkdtemp(prefix="polmira-max-", dir=str(BOT_DIR)))
-    path = temp_dir / filename
-    path.write_bytes(data)
-    return path
-
-
-def scan_max_log_urls_once(state, _first_scan):
-    changed = False
-
-    for phone_dir in sorted(PHONES_DIR.glob("*")):
-        env = read_phone_env(phone_dir / "phone.env")
-        tg_id = env.get("TG_ID", "")
-        phone_name = env.get("PHONE_NAME", phone_dir.name)
-
-        if not tg_id:
-            continue
-
-        for url in max_log_urls(phone_dir):
-            key = max_url_key(phone_name, url)
-
-            if key in state:
-                continue
-
-            path = None
-
-            try:
-                path = download_max_url(url)
-                send_document(tg_id, path, f"MAX файл: {path.name}")
-                state[key] = {
-                    "name": path.name,
-                    "phone": phone_name,
-                    "sent_at": int(time.time()),
-                    "size": path.stat().st_size,
-                    "source": "max-log",
-                    "url": url,
-                }
-                changed = True
-                print(f"Sent MAX log URL to {tg_id}: {path.name}")
-            except Exception as exc:
-                print(f"Failed to download/send MAX URL for {phone_name}: {exc}")
-            finally:
-                if path is not None:
-                    shutil.rmtree(path.parent, ignore_errors=True)
-
-    return changed
-
-
-def scan_max_downloads_once():
-    state = load_sent_state()
-    changed = False
-    first_scan = not SENT_FILES_STATE.exists()
-
-    if scan_max_log_urls_once(state, first_scan):
-        changed = True
-
-    if changed:
-        save_sent_state(state)
-
-
-def max_watcher_loop():
-    while True:
-        try:
-            scan_max_downloads_once()
-        except Exception as exc:
-            print(f"MAX watcher error: {exc}")
-        time.sleep(MAX_WATCH_INTERVAL)
-
-
 def handle_callback(callback):
     data = callback.get("data", "")
     message = callback.get("message") or {}
     chat_id = message.get("chat", {}).get("id")
     tg_id = callback.get("from", {}).get("id")
 
-    answer_callback(callback["id"])
+    safe_answer_callback(callback["id"])
 
     if not chat_id or not tg_id:
+        return
+
+    if not is_allowed_tg(tg_id):
+        deny_access(chat_id, tg_id)
         return
 
     if data == "create":
@@ -847,16 +841,16 @@ def handle_callback(callback):
         PENDING_ACTIONS.pop(str(tg_id), None)
         show_entry_menu(chat_id, tg_id)
     elif data == "install":
-        show_app_store(chat_id)
-    elif data == "change_password":
-        ask_password_change(chat_id, tg_id)
+        send_message(chat_id, "MAX теперь ставится внутри контейнера автоматически. Открой меню заново: /start")
+    elif data in {"change_credentials", "change_password"}:
+        handle_change_credentials(chat_id, tg_id)
     elif data.startswith("app:"):
-        handle_app_install(chat_id, tg_id, data)
+        send_message(chat_id, "Эта команда больше не используется. Открой меню заново: /start")
     elif data == "delete_confirm":
-        send_message(chat_id, "Удалить телефон и его данные?", DELETE_CONFIRM_MENU)
+        send_message(chat_id, "Удалить MAX-контейнер и его данные?", DELETE_CONFIRM_MENU)
     elif data == "delete":
         handle_delete(chat_id, tg_id)
-    elif data in {"start", "stop", "vpn_on", "vpn_off"}:
+    elif data in {"start", "stop"}:
         handle_action(chat_id, tg_id, data)
 
 
@@ -868,16 +862,17 @@ def handle_message(message):
     if not chat_id or not tg_id:
         return
 
+    if not is_allowed_tg(tg_id):
+        deny_access(chat_id, tg_id)
+        return
+
     if any(message.get(key) for key in ("document", "photo", "video", "animation", "audio", "voice", "video_note", "sticker")):
         handle_file_message(chat_id, tg_id, message)
         return
 
     pending = PENDING_ACTIONS.get(str(tg_id))
-    if pending and pending.get("action") == "change_password":
-        if text in {"/cancel", "cancel", "отмена"}:
-            cancel_pending(chat_id, tg_id)
-        else:
-            handle_password_message(chat_id, tg_id, text)
+    if pending and pending.get("action") == "change_credentials":
+        complete_change_credentials(chat_id, tg_id, text)
         return
 
     if text in {"/start", "/menu", "menu", "меню"}:
@@ -893,7 +888,7 @@ def main():
 
     offset = 0
     print("Polmira Telegram bot started")
-    threading.Thread(target=max_watcher_loop, daemon=True).start()
+    start_relay_server()
 
     while True:
         try:

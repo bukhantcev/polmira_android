@@ -2,42 +2,23 @@ FROM python:3.12-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        adb \
         ca-certificates \
-        curl \
-        docker.io \
-        docker-compose \
-        ffmpeg \
-        git \
-        libsdl2-2.0-0 \
-        iproute2 \
-        netcat-openbsd \
-        nginx \
-        openssl \
-        psmisc \
-        procps \
-        rsync \
-        sudo \
-        systemd \
-        tar \
-        unzip \
         util-linux \
-        wget \
-        x11vnc \
-        xvfb \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY main.py /app/main.py
-COPY polmira1.sh /app/polmira1.sh
-COPY listener/build/polmira-listener.apk /app/polmira-listener.apk
 
-RUN chmod +x /app/main.py /app/polmira1.sh
+RUN printf '%s\n' \
+        '#!/bin/sh' \
+        'exec nsenter -t 1 -m -u -i -n -p /usr/local/bin/polmira-docker "$@"' \
+        > /app/host-polmira \
+    && chmod +x /app/main.py /app/host-polmira
 
-ENV POLMIRA_BOT_ENV=/opt/polmira/bot/.env
-ENV POLMIRA_CMD=/app/polmira1.sh
-ENV POLMIRA_APP_DIR=/opt/polmira
+ENV POLMIRA_BOT_ENV=/opt/polmira-docker/bot/.env
+ENV POLMIRA_CMD=/app/host-polmira
+ENV POLMIRA_APP_DIR=/opt/polmira-docker
 ENV POLMIRA_USE_SUDO=no
 
 CMD ["python3", "/app/main.py"]
