@@ -95,6 +95,8 @@ const UI = {
         // Setup event handlers
         UI.addControlbarHandlers();
         UI.addTouchSpecificHandlers();
+        UI.installTouchWheelBridge();
+        UI.installMobileTextInputBridge();
         UI.addExtraKeysHandlers();
         UI.addMachineHandlers();
         UI.addConnectionControlHandlers();
@@ -278,6 +280,251 @@ const UI = {
             .addEventListener('touchend', UI.controlbarHandleMouseUp);
         document.getElementById("noVNC_control_bar_handle")
             .addEventListener('touchmove', UI.dragControlbarHandle);
+    },
+
+    installTouchWheelBridge() {
+        if (!isTouchDevice || UI.touchWheelBridgeInstalled) {
+            return;
+        }
+
+        UI.touchWheelBridgeInstalled = true;
+
+        let touchStartX = 0;
+        let touchStartY = 0;
+        let lastTouchX = 0;
+        let lastTouchY = 0;
+        let scrolling = false;
+
+        function isEditable(element) {
+            if (!element) return false;
+
+            const tag = (element.tagName || "").toLowerCase();
+            return tag === "textarea" ||
+                   tag === "select" ||
+                   (tag === "input" && element.type !== "hidden") ||
+                   element.isContentEditable === true;
+        }
+
+        function isControlbar(element) {
+            return !!(element && element.closest && element.closest("#noVNC_control_bar"));
+        }
+
+        function wheelTarget(pointX, pointY) {
+            return document.elementFromPoint(pointX, pointY) ||
+                   document.querySelector("canvas") ||
+                   document.body;
+        }
+
+        document.addEventListener("touchstart", event => {
+            if (event.touches.length !== 1 ||
+                isEditable(event.target) ||
+                isControlbar(event.target)) {
+                scrolling = false;
+                return;
+            }
+
+            const touch = event.touches[0];
+            touchStartX = lastTouchX = touch.clientX;
+            touchStartY = lastTouchY = touch.clientY;
+            scrolling = false;
+        }, { passive: true, capture: true });
+
+        document.addEventListener("touchmove", event => {
+            if (event.touches.length !== 1 ||
+                isEditable(event.target) ||
+                isControlbar(event.target)) {
+                return;
+            }
+
+            const touch = event.touches[0];
+            const dx = touch.clientX - lastTouchX;
+            const dy = touch.clientY - lastTouchY;
+            const totalX = touch.clientX - touchStartX;
+            const totalY = touch.clientY - touchStartY;
+
+            if (!scrolling) {
+                scrolling = Math.abs(totalY) > 10 && Math.abs(totalY) > Math.abs(totalX) * 1.2;
+            }
+
+            if (!scrolling) {
+                lastTouchX = touch.clientX;
+                lastTouchY = touch.clientY;
+                return;
+            }
+
+            event.preventDefault();
+
+            const target = wheelTarget(touch.clientX, touch.clientY);
+            target.dispatchEvent(new WheelEvent("wheel", {
+                bubbles: true,
+                cancelable: true,
+                clientX: touch.clientX,
+                clientY: touch.clientY,
+                deltaX: -dx,
+                deltaY: -dy,
+                deltaMode: 0,
+            }));
+
+            lastTouchX = touch.clientX;
+            lastTouchY = touch.clientY;
+        }, { passive: false, capture: true });
+
+        document.addEventListener("touchend", () => {
+            scrolling = false;
+        }, { passive: true, capture: true });
+    },
+
+    installMobileTextInputBridge() {
+        if (!isTouchDevice ||
+            UI.mobileTextInputInstalled ||
+            WebUtil.getConfigVar("maxofon_native_keyboard", false) === "1") {
+            return;
+        }
+
+        UI.mobileTextInputInstalled = true;
+
+        const style = document.createElement("style");
+        style.textContent = `
+            #maxofon_mobile_keyboard_button {
+                position: fixed;
+                left: 50%;
+                top: calc(100vh - 62px);
+                z-index: 100000;
+                transform: translateX(-50%);
+                width: 58px;
+                height: 44px;
+                border: 1px solid rgba(255, 255, 255, 0.22);
+                border-radius: 999px;
+                color: white;
+                background: rgba(0, 0, 0, 0.62);
+                box-shadow: 0 8px 22px rgba(0, 0, 0, 0.34);
+                font: 600 22px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            }
+
+            #maxofon_mobile_keyboard_button.maxofon_hidden {
+                display: none;
+            }
+
+            #noVNC_container.maxofon_keyboard_lift {
+                transition: transform 0.18s ease-out;
+            }
+        `;
+        document.head.appendChild(style);
+
+        const keyboardButton = document.createElement("button");
+        keyboardButton.id = "maxofon_mobile_keyboard_button";
+        keyboardButton.type = "button";
+        keyboardButton.textContent = "⌨";
+        keyboardButton.setAttribute("aria-label", "Открыть клавиатуру");
+
+        document.body.appendChild(keyboardButton);
+        let keyboardOpen = false;
+
+        function viewport() {
+            return window.visualViewport || {
+                offsetLeft: 0,
+                offsetTop: 0,
+                width: window.innerWidth,
+                height: window.innerHeight,
+            };
+        }
+
+        function updateOverlayPosition() {
+            const view = viewport();
+            const buttonTop = Math.max(view.offsetTop + 8, view.offsetTop + view.height - 62);
+
+            keyboardButton.style.top = `${buttonTop}px`;
+            keyboardButton.style.left = `${view.offsetLeft + view.width / 2}px`;
+        }
+
+        function updateViewportLift() {
+            const container = document.getElementById("noVNC_container");
+            const input = hiddenKeyboardInput();
+            if (!container || !input || !window.visualViewport) return;
+
+            const landscape = window.innerWidth > window.innerHeight;
+            const keyboardHeight = Math.max(0, window.innerHeight - window.visualViewport.height - window.visualViewport.offsetTop);
+            const shouldLift = keyboardOpen &&
+                               document.activeElement === input &&
+                               landscape &&
+                               keyboardHeight > 80;
+            const lift = shouldLift ? Math.min(keyboardHeight, window.innerHeight * 0.55) : 0;
+
+            container.classList.toggle("maxofon_keyboard_lift", lift > 0);
+            container.style.transform = lift > 0 ? `translateY(${-lift}px)` : "";
+        }
+
+        function hiddenKeyboardInput() {
+            return document.getElementById("noVNC_keyboardinput");
+        }
+
+        function openKeyboard() {
+            updateOverlayPosition();
+            const input = hiddenKeyboardInput();
+            if (!input) return;
+
+            keyboardOpen = true;
+            keyboardButton.classList.add("maxofon_hidden");
+            input.focus();
+            updateViewportLift();
+        }
+
+        function closeKeyboard() {
+            const input = hiddenKeyboardInput();
+            if (!input) return;
+
+            keyboardOpen = false;
+            input.blur();
+            keyboardButton.classList.remove("maxofon_hidden");
+            updateOverlayPosition();
+            updateViewportLift();
+        }
+
+        keyboardButton.addEventListener("click", event => {
+            event.preventDefault();
+            event.stopPropagation();
+            openKeyboard();
+        });
+
+        const input = hiddenKeyboardInput();
+        if (input) {
+            input.addEventListener("focus", () => {
+                keyboardOpen = true;
+                keyboardButton.classList.add("maxofon_hidden");
+                setTimeout(updateViewportLift, 80);
+            });
+            input.addEventListener("blur", () => {
+                keyboardOpen = false;
+                keyboardButton.classList.remove("maxofon_hidden");
+                updateOverlayPosition();
+                updateViewportLift();
+            });
+        }
+
+        document.addEventListener("touchstart", event => {
+            if (event.target === keyboardButton || event.target === input) return;
+            closeKeyboard();
+        }, { passive: true });
+
+        updateOverlayPosition();
+        window.addEventListener("resize", () => {
+            updateOverlayPosition();
+            updateViewportLift();
+        }, { passive: true });
+        window.addEventListener("orientationchange", () => {
+            updateOverlayPosition();
+            updateViewportLift();
+        }, { passive: true });
+        if (window.visualViewport) {
+            window.visualViewport.addEventListener("resize", () => {
+                updateOverlayPosition();
+                updateViewportLift();
+            }, { passive: true });
+            window.visualViewport.addEventListener("scroll", () => {
+                updateOverlayPosition();
+                updateViewportLift();
+            }, { passive: true });
+        }
     },
 
     addExtraKeysHandlers() {

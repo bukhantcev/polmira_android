@@ -10,6 +10,7 @@ NGINX_SITE="/etc/nginx/sites-available/polmira-docker"
 NGINX_SITE_LINK="/etc/nginx/sites-enabled/polmira-docker"
 NGINX_SNIPPETS_DIR="/etc/nginx/polmira-docker"
 IMAGE="${POLMIRA_MAX_IMAGE:-chtotos/polmira_max:latest}"
+MAX_CPUS="${POLMIRA_MAX_CPUS:-0.75}"
 WEB_RANGE_START=6200
 WEB_RANGE_END=6299
 PUBLIC_HOST=""
@@ -138,6 +139,61 @@ tg_is_allowed() {
     [ -n "$tg_id" ] || return 1
     create_dirs
     grep -Fxq "$tg_id" "$TG_ALLOWED_FILE"
+}
+
+validate_tg_id() {
+    local tg_id="${1:-}"
+    [[ "$tg_id" =~ ^[0-9]{3,20}$ ]]
+}
+
+dedupe_allowed_ids() {
+    create_dirs
+    awk 'NF && !seen[$0]++' "$TG_ALLOWED_FILE" > "${TG_ALLOWED_FILE}.tmp"
+    mv "${TG_ALLOWED_FILE}.tmp" "$TG_ALLOWED_FILE"
+}
+
+allow_tg_id() {
+    need_root
+    create_dirs
+
+    local tg_id="${1:-}"
+    if ! validate_tg_id "$tg_id"; then
+        say_red "BAD_TG_ID"
+        return 1
+    fi
+
+    if ! tg_is_allowed "$tg_id"; then
+        echo "$tg_id" >> "$TG_ALLOWED_FILE"
+    fi
+    dedupe_allowed_ids
+    say_green "Telegram ID разрешён: $tg_id"
+}
+
+disallow_tg_id() {
+    need_root
+    create_dirs
+
+    local tg_id="${1:-}"
+    if ! validate_tg_id "$tg_id"; then
+        say_red "BAD_TG_ID"
+        return 1
+    fi
+
+    grep -vx "$tg_id" "$TG_ALLOWED_FILE" > "${TG_ALLOWED_FILE}.tmp" || true
+    mv "${TG_ALLOWED_FILE}.tmp" "$TG_ALLOWED_FILE"
+    say_green "Telegram ID удалён из доступа: $tg_id"
+}
+
+list_allowed_ids() {
+    create_dirs
+    dedupe_allowed_ids
+    if [ ! -s "$TG_ALLOWED_FILE" ]; then
+        echo "Разрешённых Telegram ID пока нет"
+        return 0
+    fi
+
+    echo "Разрешённые Telegram ID:"
+    cat "$TG_ALLOWED_FILE"
 }
 
 safe_name_for_tg() {
@@ -387,6 +443,7 @@ start_container() {
     docker_cmd run -d \
         --name "$CONTAINER_NAME" \
         --restart unless-stopped \
+        --cpus "$MAX_CPUS" \
         --shm-size 1g \
         -p "127.0.0.1:${WEB_PORT}:6080" \
         -e "TG_ID=${TG_ID}" \
@@ -675,6 +732,9 @@ interactive_menu() {
         echo "6) Тест уведомления"
         echo "7) Показать логи контейнера"
         echo "8) Установить / обновить nginx"
+        echo "9) Разрешить Telegram ID"
+        echo "10) Запретить Telegram ID"
+        echo "11) Список разрешённых Telegram ID"
         echo "0) Выход"
         echo
 
@@ -721,6 +781,17 @@ interactive_menu() {
             8)
                 install_polmira_docker
                 ;;
+            9)
+                tg_id="$(prompt_value "Telegram ID")"
+                allow_tg_id "$tg_id"
+                ;;
+            10)
+                tg_id="$(prompt_value "Telegram ID")"
+                disallow_tg_id "$tg_id"
+                ;;
+            11)
+                list_allowed_ids
+                ;;
             0)
                 exit 0
                 ;;
@@ -757,6 +828,9 @@ cli_dispatch() {
         bot-set-password) shift; bot_set_password "$@" ;;
         bot-notify-test) shift; bot_notify_test "$@" ;;
         bot-install-app) shift; bot_install_app "$@" ;;
+        allow) shift; allow_tg_id "$@" ;;
+        disallow) shift; disallow_tg_id "$@" ;;
+        allowed) shift; list_allowed_ids "$@" ;;
         list) shift; list_instances "$@" ;;
         menu|"") interactive_menu ;;
         install) shift; install_polmira_docker "$@" ;;
@@ -775,6 +849,9 @@ if ! cli_dispatch "$@"; then
   polmira-docker bot-delete-phone TG_ID
   polmira-docker bot-set-password TG_ID LOGIN PASSWORD
   polmira-docker bot-notify-test TG_ID
+  polmira-docker allow TG_ID
+  polmira-docker disallow TG_ID
+  polmira-docker allowed
   polmira-docker list
   polmira-docker menu
 EOF

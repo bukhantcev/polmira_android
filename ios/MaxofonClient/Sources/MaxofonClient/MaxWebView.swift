@@ -8,6 +8,7 @@ struct MaxWebView: UIViewRepresentable {
     let composedText: String
     let composedTextRevision: Int
     let submitTextRevision: Int
+    let keyboardLift: CGFloat
 
     func makeUIView(context: Context) -> TransformZoomWebContainer {
         let configuration = WKWebViewConfiguration()
@@ -30,13 +31,15 @@ struct MaxWebView: UIViewRepresentable {
         webView.scrollView.panGestureRecognizer.isEnabled = false
         webView.scrollView.pinchGestureRecognizer?.isEnabled = false
         webView.allowsBackForwardNavigationGestures = false
-        webView.load(URLRequest(url: session.url))
+        webView.load(URLRequest(url: Self.appURL(from: session.url)))
 
         let container = TransformZoomWebContainer(webView: webView)
         return container
     }
 
     func updateUIView(_ container: TransformZoomWebContainer, context: Context) {
+        container.keyboardLift = keyboardLift
+
         if context.coordinator.lastKeyboardRequest != keyboardRequest {
             context.coordinator.lastKeyboardRequest = keyboardRequest
             container.setKeyboardVisible(keyboardVisible)
@@ -179,10 +182,29 @@ struct MaxWebView: UIViewRepresentable {
       }
     })();
     """
+
+    private static func appURL(from url: URL) -> URL {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return url
+        }
+
+        var items = components.queryItems ?? []
+        if !items.contains(where: { $0.name == "maxofon_native_keyboard" }) {
+            items.append(URLQueryItem(name: "maxofon_native_keyboard", value: "1"))
+        }
+        components.queryItems = items
+        return components.url ?? url
+    }
 }
 
 final class TransformZoomWebContainer: UIView, UIGestureRecognizerDelegate {
     private let webView: WKWebView
+    var keyboardLift: CGFloat = 0 {
+        didSet {
+            clampTranslation()
+            applyTransform()
+        }
+    }
     private lazy var pinchGesture = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
     private lazy var panGesture = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
     private lazy var doubleTapGesture = UITapGestureRecognizer(target: self, action: #selector(handleDoubleTap(_:)))
@@ -242,7 +264,9 @@ final class TransformZoomWebContainer: UIView, UIGestureRecognizerDelegate {
         if visible {
             script = """
             (function() {
-              return 'handled-by-native-input';
+              var input = document.getElementById('noVNC_keyboardinput');
+              if (input) input.focus();
+              return 'focused';
             })();
             """
         } else {
@@ -285,18 +309,19 @@ final class TransformZoomWebContainer: UIView, UIGestureRecognizerDelegate {
 
     private func sendTextInput(_ text: String) {
         guard !text.isEmpty else { return }
-        let encoded = jsStringLiteral(text)
-        let script = """
-        (function() {
-          var text = \(encoded);
-          var input = document.getElementById('noVNC_keyboardinput');
-          if (!input) return 'missing-input';
-          input.value = input.value + text;
-          input.dispatchEvent(new Event('input', { bubbles: true }));
-          return 'ok';
-        })();
-        """
-        webView.evaluateJavaScript(script)
+        for scalar in text.unicodeScalars {
+            let code = Int(scalar.value)
+            let script = """
+            (function() {
+              var input = document.getElementById('noVNC_keyboardinput');
+              if (!input) return 'missing-input';
+              input.value = input.value + String.fromCodePoint(\(code));
+              input.dispatchEvent(new Event('input', { bubbles: true }));
+              return 'ok';
+            })();
+            """
+            webView.evaluateJavaScript(script)
+        }
     }
 
     private func sendBackspaces(_ count: Int) {
@@ -342,16 +367,6 @@ final class TransformZoomWebContainer: UIView, UIGestureRecognizerDelegate {
         })();
         """
         webView.evaluateJavaScript(script)
-    }
-
-    private func jsStringLiteral(_ value: String) -> String {
-        guard
-            let data = try? JSONEncoder().encode(value),
-            let encoded = String(data: data, encoding: .utf8)
-        else {
-            return "\"\""
-        }
-        return encoded
     }
 
     @objc private func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
@@ -409,7 +424,7 @@ final class TransformZoomWebContainer: UIView, UIGestureRecognizerDelegate {
     }
 
     private func applyTransform() {
-        webView.transform = CGAffineTransform(translationX: translation.x, y: translation.y)
+        webView.transform = CGAffineTransform(translationX: translation.x, y: translation.y - keyboardLift)
             .scaledBy(x: scale, y: scale)
     }
 

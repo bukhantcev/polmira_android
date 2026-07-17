@@ -210,55 +210,42 @@ private struct WebSessionView: View {
     @State private var composedTextRevision = 0
     @State private var submitTextRevision = 0
     @State private var suppressNextComposedTextSync = false
+    @State private var keyboardHeight: CGFloat = 0
     @FocusState private var composedTextFocused: Bool
 
     var body: some View {
-        MaxWebView(
-            session: session,
-            keyboardRequest: keyboardRequest,
-            keyboardVisible: keyboardVisible,
-            composedText: composedText,
-            composedTextRevision: composedTextRevision,
-            submitTextRevision: submitTextRevision
-        )
+        GeometryReader { geometry in
+            MaxWebView(
+                session: session,
+                keyboardRequest: keyboardRequest,
+                keyboardVisible: keyboardVisible,
+                composedText: composedText,
+                composedTextRevision: composedTextRevision,
+                submitTextRevision: submitTextRevision,
+                keyboardLift: geometry.size.width > geometry.size.height ? keyboardHeight : 0
+            )
             .ignoresSafeArea()
             .toolbar(.hidden, for: .navigationBar)
             .overlay(alignment: .top) {
                 if keyboardVisible {
-                    HStack(spacing: 10) {
-                        TextField("Ввод", text: $composedText)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                            .submitLabel(.send)
-                            .focused($composedTextFocused)
-                            .onSubmit {
-                                guard !composedText.isEmpty else { return }
-                                submitTextRevision += 1
-                                suppressNextComposedTextSync = true
-                                composedText = ""
+                    TextField("", text: $composedText)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .submitLabel(.send)
+                        .focused($composedTextFocused)
+                        .frame(width: 1, height: 1)
+                        .opacity(0.01)
+                        .onSubmit {
+                            guard !composedText.isEmpty else { return }
+                            submitTextRevision += 1
+                            suppressNextComposedTextSync = true
+                            composedText = ""
+                        }
+                        .onAppear {
+                            DispatchQueue.main.async {
+                                composedTextFocused = true
                             }
-
-                        Button {
-                            composedTextFocused = false
-                            keyboardVisible = false
-                            keyboardRequest += 1
-                        } label: {
-                            Image(systemName: "keyboard.chevron.compact.down")
-                                .font(.system(size: 18, weight: .semibold))
-                                .foregroundStyle(.primary)
-                                .frame(width: 36, height: 36)
                         }
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(.ultraThinMaterial, in: Capsule())
-                    .padding(.horizontal, 12)
-                    .padding(.top, 8)
-                    .onAppear {
-                        DispatchQueue.main.async {
-                            composedTextFocused = true
-                        }
-                    }
                 }
             }
             .overlay(alignment: .topTrailing) {
@@ -315,6 +302,16 @@ private struct WebSessionView: View {
                 if keyboardVisible {
                     keyboardVisible = false
                 }
+                keyboardHeight = 0
             }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { notification in
+                guard
+                    let frame = notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect
+                else {
+                    return
+                }
+                keyboardHeight = frame.height
+            }
+        }
     }
 }
