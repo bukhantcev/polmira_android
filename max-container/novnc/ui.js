@@ -12,7 +12,6 @@ import { isTouchDevice, isSafari, hasScrollbarGutter, dragThreshold }
     from '../core/util/browser.js';
 import { setCapture, getPointerEvent } from '../core/util/events.js';
 import KeyTable from "../core/input/keysym.js";
-import keysyms from "../core/input/keysymdef.js";
 import Keyboard from "../core/input/keyboard.js";
 import RFB from "../core/rfb.js";
 import * as WebUtil from "./webutil.js";
@@ -36,6 +35,14 @@ const UI = {
 
     lastKeyboardinput: null,
     defaultKeyboardinputLen: 100,
+    keyboardComposing: false,
+    keyboardSkipNextInput: false,
+    keyboardTextBuffer: "",
+    keyboardTextTimer: null,
+    keyboardOperationQueue: [],
+    keyboardOperationBusy: false,
+    keyboardOperationTimer: null,
+    desktopInterceptedCodes: new Set(),
 
     inhibitReconnect: true,
     reconnectCallback: null,
@@ -95,6 +102,8 @@ const UI = {
         // Setup event handlers
         UI.addControlbarHandlers();
         UI.addTouchSpecificHandlers();
+        UI.installNativeInputBridge();
+        UI.installDesktopTextInputBridge();
         UI.installTouchWheelBridge();
         UI.installMobileTextInputBridge();
         UI.addExtraKeysHandlers();
@@ -251,6 +260,10 @@ const UI = {
         document.getElementById("noVNC_keyboardinput")
             .addEventListener('input', UI.keyInput);
         document.getElementById("noVNC_keyboardinput")
+            .addEventListener('compositionstart', UI.compositionStart);
+        document.getElementById("noVNC_keyboardinput")
+            .addEventListener('compositionend', UI.compositionEnd);
+        document.getElementById("noVNC_keyboardinput")
             .addEventListener('focus', UI.onfocusVirtualKeyboard);
         document.getElementById("noVNC_keyboardinput")
             .addEventListener('blur', UI.onblurVirtualKeyboard);
@@ -280,6 +293,102 @@ const UI = {
             .addEventListener('touchend', UI.controlbarHandleMouseUp);
         document.getElementById("noVNC_control_bar_handle")
             .addEventListener('touchmove', UI.dragControlbarHandle);
+    },
+
+    installDesktopTextInputBridge() {
+        if (UI.desktopTextInputInstalled) {
+            return;
+        }
+
+        UI.desktopTextInputInstalled = true;
+
+        function isEditable(element) {
+            if (!element) return false;
+
+            const tag = (element.tagName || "").toLowerCase();
+            return tag === "textarea" ||
+                   tag === "select" ||
+                   (tag === "input" && element.type !== "hidden") ||
+                   element.isContentEditable === true;
+        }
+
+        function isPrintableText(text) {
+            return !!text && [...text].length === 1;
+        }
+
+        const orderedKeys = {
+            Backspace: [KeyTable.XK_BackSpace, "Backspace"],
+            Delete: [KeyTable.XK_Delete, "Delete"],
+            Enter: [KeyTable.XK_Return, "Enter"],
+            Tab: [KeyTable.XK_Tab, "Tab"],
+            ArrowLeft: [KeyTable.XK_Left, "ArrowLeft"],
+            ArrowUp: [KeyTable.XK_Up, "ArrowUp"],
+            ArrowRight: [KeyTable.XK_Right, "ArrowRight"],
+            ArrowDown: [KeyTable.XK_Down, "ArrowDown"],
+            Home: [KeyTable.XK_Home, "Home"],
+            End: [KeyTable.XK_End, "End"],
+        };
+
+        function eventCode(event) {
+            return event.code || `Maxofon-${event.key}`;
+        }
+
+        function intercept(event) {
+            UI.desktopInterceptedCodes.add(eventCode(event));
+            event.preventDefault();
+            event.stopImmediatePropagation();
+        }
+
+        document.addEventListener("keydown", event => {
+            if (!UI.rfb || UI.rfb.viewOnly) return;
+            if (event.defaultPrevented) return;
+            if (event.ctrlKey || event.metaKey || event.altKey) return;
+            if (event.isComposing || event.key === "Process" || event.key === "Dead") return;
+            if (isEditable(event.target)) return;
+
+            if (isPrintableText(event.key)) {
+                intercept(event);
+                UI.sendTextFromKeyboardInput(event.key);
+                return;
+            }
+
+            const remoteKey = orderedKeys[event.key];
+            if (remoteKey && UI.hasPendingKeyboardOperations()) {
+                intercept(event);
+                UI.queueRemoteKey(remoteKey[0], remoteKey[1]);
+            }
+        }, true);
+
+        document.addEventListener("keyup", event => {
+            const code = eventCode(event);
+            if (!UI.desktopInterceptedCodes.has(code)) return;
+
+            UI.desktopInterceptedCodes.delete(code);
+            event.preventDefault();
+            event.stopImmediatePropagation();
+        }, true);
+    },
+
+    installNativeInputBridge() {
+        window.maxofonNativeInput = Object.freeze({
+            insertText(text) {
+                UI.sendTextFromKeyboardInput(String(text || ""));
+                return true;
+            },
+
+            backspace(count = 1) {
+                const safeCount = Math.min(Math.max(Number(count) || 0, 0), 4096);
+                for (let i = 0; i < safeCount; i++) {
+                    UI.queueRemoteKey(KeyTable.XK_BackSpace, "Backspace");
+                }
+                return true;
+            },
+
+            enter() {
+                UI.queueRemoteKey(KeyTable.XK_Return, "Enter");
+                return true;
+            },
+        });
     },
 
     installTouchWheelBridge() {
@@ -1693,12 +1802,173 @@ const UI = {
         const kbi = document.getElementById('noVNC_keyboardinput');
         kbi.value = new Array(UI.defaultKeyboardinputLen).join("_");
         UI.lastKeyboardinput = kbi.value;
+        try {
+            const length = kbi.value.length;
+            kbi.setSelectionRange(length, length);
+        } catch (err) {
+            // Some mobile browsers expose the input but not selection APIs.
+        }
     },
 
     keyEvent(keysym, code, down) {
         if (!UI.rfb) return;
 
         UI.rfb.sendKey(keysym, code, down);
+    },
+
+    hasPendingKeyboardOperations() {
+        return UI.keyboardOperationBusy ||
+               UI.keyboardTextBuffer.length > 0 ||
+               UI.keyboardTextTimer !== null ||
+               UI.keyboardOperationQueue.length > 0 ||
+               UI.keyboardOperationTimer !== null;
+    },
+
+    sendTextFromKeyboardInput(text) {
+        if (!text) return;
+
+        UI.keyboardTextBuffer += text;
+        if (UI.keyboardTextTimer !== null) {
+            clearTimeout(UI.keyboardTextTimer);
+        }
+        UI.keyboardTextTimer = setTimeout(() => {
+            UI.flushKeyboardText();
+        }, 280);
+    },
+
+    flushKeyboardText() {
+        if (UI.keyboardTextTimer !== null) {
+            clearTimeout(UI.keyboardTextTimer);
+            UI.keyboardTextTimer = null;
+        }
+
+        const text = UI.keyboardTextBuffer;
+        UI.keyboardTextBuffer = "";
+        if (!text) return;
+
+        const last = UI.keyboardOperationQueue[UI.keyboardOperationQueue.length - 1];
+        if (last && last.type === "text") {
+            last.text += text;
+        } else {
+            UI.keyboardOperationQueue.push({ type: "text", text });
+        }
+
+        UI.scheduleKeyboardOperations(0);
+    },
+
+    queueRemoteKey(keysym, code) {
+        if (code === "Backspace" && UI.keyboardTextBuffer.length > 0) {
+            const characters = [...UI.keyboardTextBuffer];
+            characters.pop();
+            UI.keyboardTextBuffer = characters.join("");
+
+            if (UI.keyboardTextTimer !== null) {
+                clearTimeout(UI.keyboardTextTimer);
+                UI.keyboardTextTimer = null;
+            }
+            if (UI.keyboardTextBuffer.length > 0) {
+                UI.keyboardTextTimer = setTimeout(() => {
+                    UI.flushKeyboardText();
+                }, 280);
+            }
+            return;
+        }
+
+        UI.flushKeyboardText();
+        UI.keyboardOperationQueue.push({ type: "key", keysym, code });
+        UI.scheduleKeyboardOperations(0);
+    },
+
+    sendTextOverHttp(text) {
+        const endpoint = new URL("input", window.location.href);
+        endpoint.search = "";
+        endpoint.hash = "";
+
+        return fetch(endpoint.toString(), {
+            method: "POST",
+            credentials: "same-origin",
+            cache: "no-store",
+            headers: {
+                "Content-Type": "text/plain; charset=utf-8",
+            },
+            body: text,
+        }).then(response => {
+            if (!response.ok) {
+                throw new Error(`text input failed with HTTP ${response.status}`);
+            }
+        });
+    },
+
+    scheduleKeyboardOperations(delay) {
+        if (UI.keyboardOperationBusy || UI.keyboardOperationTimer !== null) return;
+
+        UI.keyboardOperationTimer = setTimeout(() => {
+            UI.keyboardOperationTimer = null;
+            UI.processKeyboardOperation();
+        }, delay);
+    },
+
+    processKeyboardOperation() {
+        if (UI.keyboardOperationBusy) return;
+        if (!UI.rfb || UI.rfb.viewOnly) {
+            if (UI.keyboardTextTimer !== null) {
+                clearTimeout(UI.keyboardTextTimer);
+                UI.keyboardTextTimer = null;
+            }
+            UI.keyboardTextBuffer = "";
+            UI.keyboardOperationQueue.length = 0;
+            return;
+        }
+
+        const operation = UI.keyboardOperationQueue.shift();
+        if (!operation) return;
+
+        UI.keyboardOperationBusy = true;
+
+        const finish = delay => {
+            setTimeout(() => {
+                UI.keyboardOperationBusy = false;
+                UI.processKeyboardOperation();
+            }, delay);
+        };
+
+        if (operation.type === "key") {
+            UI.rfb.sendKey(operation.keysym, operation.code);
+            finish(15);
+            return;
+        }
+
+        UI.sendTextOverHttp(operation.text).then(() => {
+            UI.hideStatus();
+            finish(15);
+        }).catch(err => {
+            operation.attempts = (operation.attempts || 0) + 1;
+            Log.Error(err);
+
+            if (operation.attempts <= 5) {
+                UI.keyboardOperationQueue.unshift(operation);
+                finish(Math.min(operation.attempts * 250, 1000));
+                return;
+            }
+
+            UI.showStatus(_("Text input failed"), "error");
+            finish(15);
+        });
+    },
+
+    compositionStart() {
+        UI.keyboardComposing = true;
+    },
+
+    compositionEnd(event) {
+        UI.keyboardComposing = false;
+        if (event.data) {
+            UI.sendTextFromKeyboardInput(event.data);
+            UI.keyboardinputReset();
+            UI.keyboardSkipNextInput = true;
+        } else {
+            UI.keyInput(event);
+        }
     },
 
     // When normal keyboard events are left uncought, use the input events from
@@ -1708,6 +1978,28 @@ const UI = {
     keyInput(event) {
 
         if (!UI.rfb) return;
+        if (UI.keyboardComposing || event.isComposing) return;
+
+        if (UI.keyboardSkipNextInput) {
+            UI.keyboardSkipNextInput = false;
+            UI.keyboardinputReset();
+            return;
+        }
+
+        if (event.inputType === "deleteContentBackward") {
+            UI.queueRemoteKey(KeyTable.XK_BackSpace, "Backspace");
+            UI.keyboardinputReset();
+            return;
+        }
+
+        if (event.data &&
+            (event.inputType === "insertText" ||
+             event.inputType === "insertCompositionText" ||
+             event.inputType === "insertFromComposition")) {
+            UI.sendTextFromKeyboardInput(event.data);
+            UI.keyboardinputReset();
+            return;
+        }
 
         const newValue = event.target.value;
 
@@ -1715,6 +2007,22 @@ const UI = {
             UI.keyboardinputReset();
         }
         const oldValue = UI.lastKeyboardinput;
+        const defaultValue = new Array(UI.defaultKeyboardinputLen).join("_");
+
+        if (oldValue === defaultValue) {
+            if (/^_*$/.test(newValue)) {
+                const deleted = Math.max(defaultValue.length - newValue.length, 0);
+                for (let i = 0; i < deleted; i++) {
+                    UI.queueRemoteKey(KeyTable.XK_BackSpace, "Backspace");
+                }
+            } else if (newValue.startsWith(defaultValue)) {
+                UI.sendTextFromKeyboardInput(newValue.slice(defaultValue.length));
+            } else {
+                UI.sendTextFromKeyboardInput(newValue.replace(/^_+/, ""));
+            }
+            UI.keyboardinputReset();
+            return;
+        }
 
         let newLen;
         try {
@@ -1742,28 +2050,15 @@ const UI = {
 
         // Send the key events
         for (let i = 0; i < backspaces; i++) {
-            UI.rfb.sendKey(KeyTable.XK_BackSpace, "Backspace");
+            UI.queueRemoteKey(KeyTable.XK_BackSpace, "Backspace");
         }
-        for (let i = newLen - inputs; i < newLen; i++) {
-            UI.rfb.sendKey(keysyms.lookup(newValue.charCodeAt(i)));
-        }
+        UI.sendTextFromKeyboardInput(newValue.slice(newLen - inputs, newLen));
 
-        // Control the text content length in the keyboardinput element
-        if (newLen > 2 * UI.defaultKeyboardinputLen) {
-            UI.keyboardinputReset();
-        } else if (newLen < 1) {
-            // There always have to be some text in the keyboardinput
-            // element with which backspace can interact.
-            UI.keyboardinputReset();
-            // This sometimes causes the keyboard to disappear for a second
-            // but it is required for the android keyboard to recognize that
-            // text has been added to the field
-            event.target.blur();
-            // This has to be ran outside of the input handler in order to work
-            setTimeout(event.target.focus.bind(event.target), 0);
-        } else {
-            UI.lastKeyboardinput = newValue;
-        }
+        // Keep the hidden input as a stable short buffer. Mobile IMEs can keep
+        // composition state in the element after Cyrillic letters; resetting the
+        // buffer after every committed fragment prevents one bad diff from
+        // blocking the following characters.
+        UI.keyboardinputReset();
     },
 
 /* ------^-------

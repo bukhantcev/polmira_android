@@ -77,7 +77,7 @@ sleep 1
 
 x11vnc -display "$DISPLAY" \
     -forever \
-    -shared \
+    -nevershared \
     -xkb \
     -nopw \
     -noxdamage \

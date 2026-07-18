@@ -183,6 +183,16 @@ struct MaxWebView: UIViewRepresentable {
     })();
     """
 
+    fileprivate static func javascriptLiteral(_ text: String) -> String {
+        guard
+            let data = try? JSONEncoder().encode(text),
+            let literal = String(data: data, encoding: .utf8)
+        else {
+            return "''"
+        }
+        return literal
+    }
+
     private static func appURL(from url: URL) -> URL {
         guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
             return url
@@ -192,6 +202,8 @@ struct MaxWebView: UIViewRepresentable {
         if !items.contains(where: { $0.name == "maxofon_native_keyboard" }) {
             items.append(URLQueryItem(name: "maxofon_native_keyboard", value: "1"))
         }
+        items.removeAll(where: { $0.name == "maxofon_ui" })
+        items.append(URLQueryItem(name: "maxofon_ui", value: "20260718-6"))
         components.queryItems = items
         return components.url ?? url
     }
@@ -309,32 +321,24 @@ final class TransformZoomWebContainer: UIView, UIGestureRecognizerDelegate {
 
     private func sendTextInput(_ text: String) {
         guard !text.isEmpty else { return }
-        for scalar in text.unicodeScalars {
-            let code = Int(scalar.value)
-            let script = """
-            (function() {
-              var input = document.getElementById('noVNC_keyboardinput');
-              if (!input) return 'missing-input';
-              input.value = input.value + String.fromCodePoint(\(code));
-              input.dispatchEvent(new Event('input', { bubbles: true }));
-              return 'ok';
-            })();
-            """
-            webView.evaluateJavaScript(script)
-        }
+        let payload = MaxWebView.javascriptLiteral(text)
+        let script = """
+        (function() {
+          var bridge = window.maxofonNativeInput;
+          if (!bridge || !bridge.insertText) return 'missing-native-input-bridge';
+          return bridge.insertText(\(payload)) ? 'ok' : 'failed';
+        })();
+        """
+        webView.evaluateJavaScript(script)
     }
 
     private func sendBackspaces(_ count: Int) {
         guard count > 0 else { return }
         let script = """
         (function() {
-          var input = document.getElementById('noVNC_keyboardinput');
-          if (!input) return 'missing-input';
-          for (var i = 0; i < \(count); i++) {
-            input.value = input.value.slice(0, Math.max(0, input.value.length - 1));
-            input.dispatchEvent(new Event('input', { bubbles: true }));
-          }
-          return 'ok';
+          var bridge = window.maxofonNativeInput;
+          if (!bridge || !bridge.backspace) return 'missing-native-input-bridge';
+          return bridge.backspace(\(count)) ? 'ok' : 'failed';
         })();
         """
         webView.evaluateJavaScript(script)
@@ -343,27 +347,9 @@ final class TransformZoomWebContainer: UIView, UIGestureRecognizerDelegate {
     private func sendEnter() {
         let script = """
         (function() {
-          var input = document.getElementById('noVNC_keyboardinput');
-          var target = input || document.querySelector('canvas') || document.body;
-          var down = new KeyboardEvent('keydown', {
-            key: 'Enter',
-            code: 'Enter',
-            keyCode: 13,
-            which: 13,
-            bubbles: true,
-            cancelable: true
-          });
-          var up = new KeyboardEvent('keyup', {
-            key: 'Enter',
-            code: 'Enter',
-            keyCode: 13,
-            which: 13,
-            bubbles: true,
-            cancelable: true
-          });
-          target.dispatchEvent(down);
-          target.dispatchEvent(up);
-          return 'ok';
+          var bridge = window.maxofonNativeInput;
+          if (!bridge || !bridge.enter) return 'missing-native-input-bridge';
+          return bridge.enter() ? 'ok' : 'failed';
         })();
         """
         webView.evaluateJavaScript(script)

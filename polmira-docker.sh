@@ -15,8 +15,8 @@ WEB_RANGE_START=6200
 WEB_RANGE_END=6299
 PUBLIC_HOST=""
 USE_HTTPS="yes"
-SSL_CERT="/root/.acme.sh/polmira.bukhantcev.ru_ecc/fullchain.cer"
-SSL_KEY="/root/.acme.sh/polmira.bukhantcev.ru_ecc/polmira.bukhantcev.ru.key"
+SSL_CERT=""
+SSL_KEY=""
 
 NORMAL='\033[0m'
 GREEN='\033[32m'
@@ -63,12 +63,6 @@ nginx_cmd() {
 create_dirs() {
     mkdir -p "$APP_DIR" "$INSTANCES_DIR" "$NGINX_SNIPPETS_DIR" "$APP_DIR/bot"
     touch "$TG_ALLOWED_FILE"
-
-    if [ ! -s "$TG_ALLOWED_FILE" ] && [ -f /opt/polmira-linux/tg-allowed.txt ]; then
-        cp /opt/polmira-linux/tg-allowed.txt "$TG_ALLOWED_FILE"
-    elif [ ! -s "$TG_ALLOWED_FILE" ] && [ -f /opt/polmira/tg-allowed.txt ]; then
-        cp /opt/polmira/tg-allowed.txt "$TG_ALLOWED_FILE"
-    fi
 }
 
 load_config() {
@@ -77,10 +71,54 @@ load_config() {
         source "$CONFIG_FILE"
     fi
 
-    PUBLIC_HOST="${PUBLIC_HOST:-polmira.bukhantcev.ru}"
+    PUBLIC_HOST="${PUBLIC_HOST:-}"
     USE_HTTPS="${USE_HTTPS:-yes}"
-    SSL_CERT="${SSL_CERT:-/root/.acme.sh/${PUBLIC_HOST}_ecc/fullchain.cer}"
-    SSL_KEY="${SSL_KEY:-/root/.acme.sh/${PUBLIC_HOST}_ecc/${PUBLIC_HOST}.key}"
+    if [ -n "$PUBLIC_HOST" ]; then
+        SSL_CERT="${SSL_CERT:-/root/.acme.sh/${PUBLIC_HOST}_ecc/fullchain.cer}"
+        SSL_KEY="${SSL_KEY:-/root/.acme.sh/${PUBLIC_HOST}_ecc/${PUBLIC_HOST}.key}"
+    else
+        SSL_CERT="${SSL_CERT:-}"
+        SSL_KEY="${SSL_KEY:-}"
+    fi
+}
+
+require_public_host() {
+    if [ -z "${PUBLIC_HOST:-}" ]; then
+        say_red "PUBLIC_HOST не задан. Запусти: polmira-docker install"
+        return 1
+    fi
+}
+
+configure_public_access() {
+    load_config
+
+    local value
+    if [ -z "${PUBLIC_HOST:-}" ]; then
+        read -r -p "Домен для noVNC/API, например max.example.com: " value
+        PUBLIC_HOST="$value"
+    fi
+
+    require_public_host
+
+    read -r -p "Использовать HTTPS? [yes/no] (${USE_HTTPS:-yes}): " value
+    USE_HTTPS="${value:-${USE_HTTPS:-yes}}"
+
+    if [ "$USE_HTTPS" = "yes" ]; then
+        local default_cert default_key
+        default_cert="/root/.acme.sh/${PUBLIC_HOST}_ecc/fullchain.cer"
+        default_key="/root/.acme.sh/${PUBLIC_HOST}_ecc/${PUBLIC_HOST}.key"
+
+        read -r -p "Путь к SSL cert (${SSL_CERT:-$default_cert}): " value
+        SSL_CERT="${value:-${SSL_CERT:-$default_cert}}"
+
+        read -r -p "Путь к SSL key (${SSL_KEY:-$default_key}): " value
+        SSL_KEY="${value:-${SSL_KEY:-$default_key}}"
+    else
+        SSL_CERT=""
+        SSL_KEY=""
+    fi
+
+    save_config
 }
 
 save_config() {
@@ -291,6 +329,7 @@ write_htpasswd() {
 
 write_nginx_main_config() {
     load_config
+    require_public_host
     save_config
     mkdir -p "$NGINX_SNIPPETS_DIR"
 
@@ -381,6 +420,20 @@ location = ${WEB_PATH}vnc.html {
     proxy_pass http://127.0.0.1:${WEB_PORT}/vnc.html;
 }
 
+location = ${WEB_PATH}input {
+    auth_basic "Polmira";
+    auth_basic_user_file ${instance_dir}/htpasswd;
+    client_max_body_size 64k;
+
+    proxy_http_version 1.1;
+    proxy_set_header X-Polmira-Tg-Id "${TG_ID}";
+    proxy_set_header X-Polmira-Secret "${RELAY_SECRET}";
+    proxy_set_header Content-Type "text/plain; charset=utf-8";
+    proxy_read_timeout 15s;
+
+    proxy_pass http://172.17.0.1:8788/input;
+}
+
 location ${WEB_PATH} {
     auth_basic "Polmira";
     auth_basic_user_file ${instance_dir}/htpasswd;
@@ -407,6 +460,18 @@ remove_instance_nginx_conf() {
     local instance_name="$1"
     rm -f "${NGINX_SNIPPETS_DIR}/${instance_name}.conf"
     nginx_cmd -t && systemctl reload nginx
+}
+
+refresh_nginx() {
+    need_root
+    create_dirs
+    load_config
+    write_nginx_main_config
+
+    local env_file
+    while IFS= read -r env_file; do
+        write_instance_nginx_conf "$(dirname "$env_file")"
+    done < <(find "$INSTANCES_DIR" -mindepth 2 -maxdepth 2 -name instance.env 2>/dev/null | sort)
 }
 
 ensure_image() {
@@ -686,6 +751,44 @@ bot_notify_test() {
     say_green "Тестовое уведомление отправлено в DBus"
 }
 
+bot_input() {
+    need_root
+    create_dirs
+
+    local instance_dir input_file input_size
+    instance_dir="$(instance_dir_or_fail "${1:-}")" || return 1
+    # shellcheck disable=SC1091
+    source "$instance_dir/instance.env"
+
+    if [ "$(container_status "$CONTAINER_NAME")" != "running" ]; then
+        say_red "CONTAINER_NOT_RUNNING"
+        return 1
+    fi
+
+    input_file="$(mktemp)"
+    cat > "$input_file"
+    input_size="$(wc -c < "$input_file")"
+
+    if [ "$input_size" -le 0 ] || [ "$input_size" -gt 65536 ]; then
+        rm -f "$input_file"
+        say_red "BAD_INPUT_SIZE"
+        return 1
+    fi
+
+    if ! docker_cmd exec -i -u polmira \
+        -e DISPLAY=:20 \
+        -e LANG=C.UTF-8 \
+        "$CONTAINER_NAME" sh -lc \
+        'xclip -selection clipboard -in && sleep 0.08 && xdotool key --clearmodifiers ctrl+v' \
+        < "$input_file"; then
+        rm -f "$input_file"
+        say_red "INPUT_FAILED"
+        return 1
+    fi
+
+    rm -f "$input_file"
+}
+
 bot_install_app() {
     bot_start_phone "$@"
 }
@@ -720,7 +823,7 @@ interactive_menu() {
         clear || true
         echo "Polmira MAX Docker"
         echo "=================="
-        echo "Домен: ${PUBLIC_HOST:-polmira.bukhantcev.ru}"
+        echo "Домен: ${PUBLIC_HOST:-не задан}"
         echo
         list_instances
         echo
@@ -809,8 +912,7 @@ install_polmira_docker() {
     need_root
     create_dirs
     ensure_relay_secret
-    load_config
-    save_config
+    configure_public_access
     write_nginx_main_config
     ensure_image
     say_green "Polmira Docker подготовлена"
@@ -827,11 +929,13 @@ cli_dispatch() {
         bot-delete-phone) shift; bot_delete_phone "$@" ;;
         bot-set-password) shift; bot_set_password "$@" ;;
         bot-notify-test) shift; bot_notify_test "$@" ;;
+        bot-input) shift; bot_input "$@" ;;
         bot-install-app) shift; bot_install_app "$@" ;;
         allow) shift; allow_tg_id "$@" ;;
         disallow) shift; disallow_tg_id "$@" ;;
         allowed) shift; list_allowed_ids "$@" ;;
         list) shift; list_instances "$@" ;;
+        refresh-nginx) shift; refresh_nginx "$@" ;;
         menu|"") interactive_menu ;;
         install) shift; install_polmira_docker "$@" ;;
         *) return 1 ;;
@@ -849,10 +953,12 @@ if ! cli_dispatch "$@"; then
   polmira-docker bot-delete-phone TG_ID
   polmira-docker bot-set-password TG_ID LOGIN PASSWORD
   polmira-docker bot-notify-test TG_ID
+  polmira-docker bot-input TG_ID < UTF8_TEXT_FILE
   polmira-docker allow TG_ID
   polmira-docker disallow TG_ID
   polmira-docker allowed
   polmira-docker list
+  polmira-docker refresh-nginx
   polmira-docker menu
 EOF
     exit 1

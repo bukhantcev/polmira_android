@@ -865,7 +865,7 @@ INDEX_HTML = r"""<!doctype html>
     <aside>
       <div class="panel create">
         <label for="tg">Telegram ID</label>
-        <input id="tg" inputmode="numeric" placeholder="404354012">
+        <input id="tg" inputmode="numeric" placeholder="123456789">
         <button id="create" class="primary">Создать телефон</button>
       </div>
       <div id="phoneList" class="phone-list"></div>

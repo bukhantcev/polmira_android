@@ -24,6 +24,7 @@ RUN apt-get -o Acquire::Retries=5 update \
         python3-gi \
         websockify \
         wget \
+        xclip \
         libnotify-bin \
         xdotool \
         x11vnc \
@@ -48,6 +49,7 @@ COPY max-container/notification-daemon.py /usr/local/bin/polmira-notification-da
 COPY max-container/file-watcher.py /usr/local/bin/polmira-file-watcher
 COPY max-container/novnc/ui.js /usr/share/novnc/app/ui.js
 COPY max-container/novnc/base.css /usr/share/novnc/app/styles/base.css
+RUN sed -i -E 's#src="app/ui\.js(\?[^\"]*)?"#src="app/ui.js?v=maxofon-20260718-6"#' /usr/share/novnc/vnc.html
 RUN chmod +x /usr/local/bin/polmira-start-session /usr/local/bin/polmira-notification-daemon /usr/local/bin/polmira-file-watcher
 
 EXPOSE 6080

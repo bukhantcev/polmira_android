@@ -52,6 +52,9 @@ POLMIRA_RELAY_PORT = int(os.environ.get("POLMIRA_RELAY_PORT", "8788"))
 TELEGRAM_API_RETRIES = int(os.environ.get("TELEGRAM_API_RETRIES", "3"))
 TELEGRAM_SEND_TIMEOUT = int(os.environ.get("TELEGRAM_SEND_TIMEOUT", "12"))
 PENDING_ACTIONS = {}
+INPUT_LOCKS = {}
+INPUT_LOCKS_GUARD = threading.Lock()
+MAX_INPUT_BYTES = int(os.environ.get("POLMIRA_INPUT_MAX_BYTES", str(64 * 1024)))
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 LOCAL_POLMIRA = SCRIPT_DIR / "polmira-docker.sh"
@@ -387,8 +390,52 @@ class RelayHandler(BaseHTTPRequestHandler):
             self.handle_file()
             return
 
+        if self.path == "/input":
+            self.handle_input()
+            return
+
         self.send_response(404)
         self.end_headers()
+
+    def handle_input(self):
+        try:
+            tg_id = str(self.headers.get("X-Polmira-Tg-Id") or "").strip()
+            secret = str(self.headers.get("X-Polmira-Secret") or "")
+            length = int(self.headers.get("Content-Length", "0"))
+
+            if not tg_id or length <= 0:
+                self.send_response(400)
+                self.end_headers()
+                return
+
+            if length > MAX_INPUT_BYTES:
+                self.send_response(413)
+                self.end_headers()
+                return
+
+            if not is_allowed_tg(tg_id) or not is_valid_relay_secret(tg_id, secret):
+                self.send_response(403)
+                self.end_headers()
+                return
+
+            text = self.rfile.read(length).decode("utf-8")
+            if not text:
+                self.send_response(204)
+                self.end_headers()
+                return
+
+            with input_lock(tg_id):
+                run_polmira("bot-input", tg_id, input_text=text)
+
+            self.send_response(204)
+            self.end_headers()
+        except UnicodeDecodeError:
+            self.send_response(400)
+            self.end_headers()
+        except Exception as exc:
+            print(f"Input relay error: {exc}", flush=True)
+            self.send_response(500)
+            self.end_headers()
 
     def handle_notify(self):
         try:
@@ -577,10 +624,11 @@ def polmira_command():
     return command
 
 
-def run_polmira(*args):
+def run_polmira(*args, input_text=None):
     try:
         proc = subprocess.run(
             polmira_command() + list(args),
+            input=input_text,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -598,6 +646,11 @@ def run_polmira(*args):
         raise RuntimeError(output or f"polmira exited with {proc.returncode}")
 
     return output
+
+
+def input_lock(tg_id):
+    with INPUT_LOCKS_GUARD:
+        return INPUT_LOCKS.setdefault(str(tg_id), threading.Lock())
 
 
 def strip_ansi(text):
