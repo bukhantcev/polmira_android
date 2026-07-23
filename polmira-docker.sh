@@ -1084,6 +1084,7 @@ start_selkies_container() {
         -e "TZ=Europe/Moscow" \
         -e "LANG=C.UTF-8" \
         -e "LC_ALL=C.UTF-8" \
+        -e "PULSE_SERVER=unix:/defaults/native" \
         -e "TITLE=Maxofon" \
         -e "SUBFOLDER=${WEB_PATH}" \
         -e "PIXELFLUX_WAYLAND=${wayland_enabled}" \
@@ -1105,7 +1106,7 @@ start_selkies_container() {
         -e "SELKIES_FILE_TRANSFERS=none" \
         -e "SELKIES_COMMAND_ENABLED=false" \
         -e "SELKIES_UI_SHOW_LOGO=false" \
-        -e "SELKIES_UI_SHOW_CORE_BUTTONS=false" \
+        -e "SELKIES_UI_SHOW_CORE_BUTTONS=true" \
         -e "SELKIES_UI_SIDEBAR_SHOW_FILES=false" \
         -e "SELKIES_UI_SIDEBAR_SHOW_APPS=false" \
         -e "SELKIES_UI_SIDEBAR_SHOW_SHARING=false" \

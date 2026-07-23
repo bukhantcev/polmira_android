@@ -1,5 +1,6 @@
 import SwiftUI
 import WebKit
+import AVFoundation
 
 struct MaxWebView: UIViewRepresentable {
     let session: MaxofonSession
@@ -11,10 +12,24 @@ struct MaxWebView: UIViewRepresentable {
     let keyboardLift: CGFloat
 
     func makeUIView(context: Context) -> TransformZoomWebContainer {
+        let audioSession = AVAudioSession.sharedInstance()
+        try? audioSession.setCategory(
+            .playback,
+            mode: .moviePlayback,
+            options: [.allowAirPlay, .allowBluetoothA2DP]
+        )
+        try? audioSession.setActive(true)
+
         let configuration = WKWebViewConfiguration()
         configuration.allowsInlineMediaPlayback = true
+        configuration.mediaTypesRequiringUserActionForPlayback = []
 
         let controller = WKUserContentController()
+        controller.addUserScript(WKUserScript(
+            source: Self.audioUnlockScript,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        ))
         controller.addUserScript(WKUserScript(
             source: Self.mobileHelperScript,
             injectionTime: .atDocumentEnd,
@@ -89,6 +104,53 @@ struct MaxWebView: UIViewRepresentable {
             completionHandler(.useCredential, credential)
         }
     }
+
+    private static let audioUnlockScript = """
+    (function() {
+      if (window.__maxofonAudioUnlockInstalled) return;
+      window.__maxofonAudioUnlockInstalled = true;
+
+      var contexts = [];
+
+      function remember(context) {
+        if (contexts.indexOf(context) === -1) contexts.push(context);
+        context.resume().catch(function() {});
+        return context;
+      }
+
+      function wrapAudioContext(name) {
+        var Original = window[name];
+        if (!Original || typeof Proxy === 'undefined') return;
+
+        try {
+          window[name] = new Proxy(Original, {
+            construct: function(target, args) {
+              return remember(Reflect.construct(target, args));
+            }
+          });
+        } catch (_) {}
+      }
+
+      function resumeAudio() {
+        contexts.forEach(function(context) {
+          if (context.state !== 'running') context.resume().catch(function() {});
+        });
+
+        document.querySelectorAll('audio, video').forEach(function(media) {
+          if (media.paused) media.play().catch(function() {});
+        });
+      }
+
+      wrapAudioContext('AudioContext');
+      wrapAudioContext('webkitAudioContext');
+
+      ['pointerdown', 'touchend', 'click', 'keydown'].forEach(function(eventName) {
+        window.addEventListener(eventName, resumeAudio, { capture: true, passive: true });
+      });
+
+      window.__maxofonResumeAudio = resumeAudio;
+    })();
+    """
 
     private static let mobileHelperScript = """
     (function() {
