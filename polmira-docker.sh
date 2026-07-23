@@ -970,6 +970,7 @@ start_selkies_container() {
     fi
 
     mkdir -p "$instance_dir/selkies-home" "$instance_dir/selkies-home/Downloads"
+    chown 1000:1000 "$instance_dir/selkies-home" "$instance_dir/selkies-home/Downloads"
     chmod 755 "$instance_dir" "$instance_dir/selkies-home" "$instance_dir/selkies-home/Downloads"
 
     bot_token="$(load_bot_env_value TELEGRAM_BOT_TOKEN || true)"
