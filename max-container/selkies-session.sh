@@ -9,13 +9,22 @@ export POLMIRA_FILE_WATCHER_STATE="${POLMIRA_FILE_WATCHER_STATE:-$HOME/.cache/po
 log_dir="$HOME/.cache/polmira/logs"
 mkdir -p "$HOME/Downloads" "$HOME/.local/share/ONEME" "$log_dir"
 
-python3 /usr/local/bin/polmira-notification-daemon \
-    >>"$log_dir/notifications.log" 2>&1 &
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ "${POLMIRA_DBUS_SESSION:-}" != "1" ]; then
+    export POLMIRA_DBUS_SESSION=1
+    exec dbus-run-session -- "$0"
+fi
 
-python3 /usr/local/bin/polmira-file-watcher \
-    >>"$log_dir/file-watcher.log" 2>&1 &
+if ! pgrep -u "$(id -u)" -f 'python3 /usr/local/bin/polmira-notification-daemon' >/dev/null; then
+    python3 /usr/local/bin/polmira-notification-daemon \
+        >>"$log_dir/notifications.log" 2>&1 &
+fi
 
-gnome-keyring-daemon --start --components=secrets \
+if ! pgrep -u "$(id -u)" -f 'python3 /usr/local/bin/polmira-file-watcher' >/dev/null; then
+    python3 /usr/local/bin/polmira-file-watcher \
+        >>"$log_dir/file-watcher.log" 2>&1 &
+fi
+
+printf '\n' | gnome-keyring-daemon --login --components=secrets \
     >>"$log_dir/keyring.log" 2>&1 || true
 
 exec /usr/share/max/bin/max >>"$log_dir/max.log" 2>&1

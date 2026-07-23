@@ -10,7 +10,7 @@ NGINX_SITE="/etc/nginx/sites-available/polmira-docker"
 NGINX_SITE_LINK="/etc/nginx/sites-enabled/polmira-docker"
 NGINX_SNIPPETS_DIR="/etc/nginx/polmira-docker"
 IMAGE="${POLMIRA_MAX_IMAGE:-chtotos/polmira_max:latest}"
-SELKIES_IMAGE="${POLMIRA_SELKIES_IMAGE:-chtotos/polmira_max_selkies:2026.07.23}"
+SELKIES_IMAGE="${POLMIRA_SELKIES_IMAGE:-chtotos/polmira_max_selkies:2026.07.23-gpu2}"
 SELKIES_SOURCE_ARCHIVE="${POLMIRA_SELKIES_SOURCE_ARCHIVE:-https://github.com/bukhantcev/polmira_android/archive/refs/heads/master.tar.gz}"
 AUTHELIA_IMAGE="${POLMIRA_AUTHELIA_IMAGE:-authelia/authelia:4.39.20}"
 AUTHELIA_DIR="$APP_DIR/authelia"
@@ -55,6 +55,75 @@ docker_cmd() {
         command nsenter -t 1 -m -u -i -n -p docker "$@"
     else
         command docker "$@"
+    fi
+}
+
+nvidia_runtime_available() {
+    docker_cmd info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"nvidia"'
+}
+
+nvidia_selkies_available() {
+    local driver_major
+
+    [ -e /dev/nvidia0 ] || return 1
+    exists nvidia-smi || return 1
+    nvidia_runtime_available || return 1
+
+    driver_major="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null \
+        | head -n1 | cut -d. -f1)"
+    [[ "$driver_major" =~ ^[0-9]+$ ]] && [ "$driver_major" -ge 580 ]
+}
+
+find_dri_render_node() {
+    local node vendor
+
+    for node in /sys/class/drm/renderD*; do
+        [ -e "$node" ] || continue
+        vendor="$(cat "$node/device/vendor" 2>/dev/null || true)"
+        case "$vendor" in
+            0x8086|0x1002)
+                echo "/dev/dri/$(basename "$node")"
+                return 0
+                ;;
+        esac
+    done
+
+    return 1
+}
+
+ensure_nvidia_container_runtime() {
+    [ -e /dev/nvidia0 ] || return 0
+    exists nvidia-smi || return 0
+    nvidia_runtime_available && return 0
+
+    if ! exists apt-get; then
+        say_red "NVIDIA найдена, но NVIDIA Container Toolkit нужно установить вручную"
+        return 0
+    fi
+
+    say_green "Настраиваю NVIDIA Container Toolkit для Selkies"
+    if ! (
+        set -e
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y --no-install-recommends ca-certificates curl gnupg
+        mkdir -p /usr/share/keyrings
+        curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+            | gpg --dearmor --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+        curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+            | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+            > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+        apt-get update
+        apt-get install -y nvidia-container-toolkit
+        nvidia-ctk runtime configure --runtime=docker
+        systemctl restart docker
+        for _ in $(seq 1 30); do
+            docker_cmd info >/dev/null 2>&1 && exit 0
+            sleep 1
+        done
+        exit 1
+    ); then
+        say_red "NVIDIA runtime не настроен, Selkies попробует Intel/AMD GPU"
     fi
 }
 
@@ -958,10 +1027,13 @@ start_legacy_container() {
 
 start_selkies_container() {
     local instance_dir="$1"
-    local bot_token relay_secret
+    local bot_token relay_secret render_node gpu_mode
+    local wayland_enabled="false"
     local -a gpu_args=()
+    local -a gpu_env=()
     # shellcheck disable=SC1091
     source "$instance_dir/instance.env"
+    gpu_mode="${SELKIES_GPU_MODE:-auto}"
 
     ensure_selkies_image
     if [ -z "${RELAY_SECRET:-}" ]; then
@@ -976,7 +1048,20 @@ start_selkies_container() {
     bot_token="$(load_bot_env_value TELEGRAM_BOT_TOKEN || true)"
     relay_secret="$RELAY_SECRET"
 
-    if [ -d /dev/dri ]; then
+    if [ "$gpu_mode" != "off" ] \
+        && grep -qw avx2 /proc/cpuinfo 2>/dev/null \
+        && nvidia_selkies_available; then
+        gpu_args=(--runtime nvidia --gpus all)
+        gpu_env=(-e "AUTO_GPU=true")
+        wayland_enabled="true"
+    elif [ "$gpu_mode" != "off" ] \
+        && grep -qw avx2 /proc/cpuinfo 2>/dev/null \
+        && [ -d /dev/dri ] \
+        && render_node="$(find_dri_render_node)"; then
+        gpu_args=(--device /dev/dri:/dev/dri)
+        gpu_env=(-e "DRINODE=${render_node}" -e "DRI_NODE=${render_node}")
+        wayland_enabled="true"
+    elif [ -d /dev/dri ]; then
         gpu_args=(--device /dev/dri:/dev/dri)
     fi
 
@@ -992,6 +1077,7 @@ start_selkies_container() {
         --shm-size 1g \
         --security-opt no-new-privileges=true \
         "${gpu_args[@]}" \
+        "${gpu_env[@]}" \
         -p "127.0.0.1:${WEB_PORT}:3000" \
         -e "PUID=1000" \
         -e "PGID=1000" \
@@ -1000,8 +1086,7 @@ start_selkies_container() {
         -e "LC_ALL=C.UTF-8" \
         -e "TITLE=Maxofon" \
         -e "SUBFOLDER=${WEB_PATH}" \
-        -e "PIXELFLUX_WAYLAND=false" \
-        -e "AUTO_GPU=true" \
+        -e "PIXELFLUX_WAYLAND=${wayland_enabled}" \
         -e "NO_GAMEPAD=true" \
         -e "SELKIES_UI_TITLE=Maxofon" \
         -e "SELKIES_AUDIO_ENABLED=false" \
@@ -1506,6 +1591,7 @@ install_polmira_docker() {
     ensure_relay_secret
     configure_public_access
     write_nginx_main_config
+    ensure_nvidia_container_runtime
     ensure_selkies_image
     ensure_authelia_image
     sync_authelia
