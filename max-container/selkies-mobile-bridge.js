@@ -462,12 +462,156 @@
 
   installLandscapeKeyboardLift();
 
-  function mobileInputEndpoint() {
-    const endpoint = new URL("input", window.location.href);
+  function relativeEndpoint(path) {
+    const endpoint = new URL(path, window.location.href);
     endpoint.search = "";
     endpoint.hash = "";
     return endpoint.href;
   }
+
+  function mobileInputEndpoint() {
+    return relativeEndpoint("input");
+  }
+
+  function base64UrlToUint8Array(value) {
+    const padding = "=".repeat((4 - (value.length % 4)) % 4);
+    const base64 = (value + padding).replace(/-/g, "+").replace(/_/g, "/");
+    const raw = atob(base64);
+    return Uint8Array.from(raw, (character) => character.charCodeAt(0));
+  }
+
+  async function savePushSubscription(subscription) {
+    const response = await fetch(relativeEndpoint("push/subscribe"), {
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+      redirect: "error",
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify(subscription.toJSON()),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Push subscribe returned HTTP ${response.status}.`);
+    }
+  }
+
+  function showPushButton(onClick) {
+    if (!document.body || document.getElementById("maxofon-enable-push")) {
+      return null;
+    }
+
+    const button = document.createElement("button");
+    button.id = "maxofon-enable-push";
+    button.type = "button";
+    button.textContent = "Включить уведомления";
+    button.style.cssText = [
+      "position:fixed",
+      "top:max(8px,env(safe-area-inset-top))",
+      "left:50%",
+      "z-index:2147483646",
+      "min-height:40px",
+      "max-width:calc(100vw - 24px)",
+      "padding:8px 14px",
+      "transform:translateX(-50%)",
+      "border:1px solid rgba(255,255,255,.28)",
+      "border-radius:7px",
+      "background:#126fe8",
+      "box-shadow:0 2px 10px rgba(0,0,0,.28)",
+      "color:#fff",
+      "font:600 14px system-ui,sans-serif",
+      "letter-spacing:0",
+      "white-space:nowrap",
+    ].join(";");
+    button.addEventListener("click", onClick);
+    document.body.append(button);
+    return button;
+  }
+
+  async function installWebPush() {
+    if (
+      !("serviceWorker" in navigator)
+      || !("Notification" in window)
+      || !("PushManager" in window)
+    ) {
+      return;
+    }
+
+    try {
+      const registration = await navigator.serviceWorker.register(
+        "./polmira-sw.js?v=20260723-push1",
+        { scope: "./" },
+      );
+      await registration.update();
+
+      const existing = await registration.pushManager.getSubscription();
+      if (existing) {
+        await savePushSubscription(existing);
+        return;
+      }
+
+      let button = null;
+      const enable = async () => {
+        const permission = await Notification.requestPermission();
+
+        if (permission !== "granted") {
+          if (button) {
+            button.textContent = "Разреши уведомления в настройках";
+            button.disabled = true;
+          }
+          return;
+        }
+
+        if (button) {
+          button.textContent = "Подключаю уведомления...";
+          button.disabled = true;
+        }
+
+        try {
+          const keyResponse = await fetch(relativeEndpoint("push/public-key"), {
+            credentials: "same-origin",
+            cache: "no-store",
+            redirect: "error",
+          });
+          if (!keyResponse.ok) {
+            throw new Error(`Push key returned HTTP ${keyResponse.status}.`);
+          }
+
+          const keyPayload = await keyResponse.json();
+          const subscription = await registration.pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey: base64UrlToUint8Array(keyPayload.publicKey),
+          });
+          await savePushSubscription(subscription);
+
+          if (button) {
+            button.textContent = "Уведомления включены";
+            setTimeout(() => button?.remove(), 1600);
+          }
+        } catch (error) {
+          console.error("Maxofon: Web Push setup failed.", error);
+          if (button) {
+            button.textContent = "Не удалось включить уведомления";
+            button.disabled = false;
+          }
+        }
+      };
+
+      const addButton = () => {
+        button = showPushButton(enable);
+      };
+      if (document.body) {
+        addButton();
+      } else {
+        document.addEventListener("DOMContentLoaded", addButton, { once: true });
+      }
+    } catch (error) {
+      console.error("Maxofon: service worker setup failed.", error);
+    }
+  }
+
+  installWebPush();
 
   async function postMobileText(text, attempt = 0) {
     try {

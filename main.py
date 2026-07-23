@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import base64
 import json
 import mimetypes
 import os
@@ -14,6 +15,15 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+try:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from pywebpush import webpush
+except ImportError:
+    serialization = None
+    ec = None
+    webpush = None
 
 
 def load_env_file(path):
@@ -38,15 +48,25 @@ def load_env_file(path):
 
 load_env_file(os.environ.get("POLMIRA_BOT_ENV", "/opt/polmira-docker/bot/.env"))
 
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-POLMIRA_CMD = os.environ.get("POLMIRA_CMD", "/usr/local/bin/polmira-docker")
+POLMIRA_CMD = os.environ.get("POLMIRA_CMD", "/usr/local/bin/polmira")
 APP_DIR = Path(os.environ.get("POLMIRA_APP_DIR", "/opt/polmira-docker"))
-APPS_DIR = APP_DIR / "apps"
-PHONES_DIR = APP_DIR / "instances"
-BOT_DIR = APP_DIR / "bot"
+load_env_file(APP_DIR / "config.env")
+
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+INSTANCES_DIR = APP_DIR / "instances"
+STATE_DIR = APP_DIR / "state"
+NOTIFICATION_STATE_FILE = STATE_DIR / "notification-routing.json"
+VAPID_PRIVATE_KEY_FILE = STATE_DIR / "vapid-private.pem"
+VAPID_PUBLIC_KEY_FILE = STATE_DIR / "vapid-public.txt"
 AUTHELIA_NOTIFICATION_FILE = APP_DIR / "authelia" / "notification.txt"
 POLL_TIMEOUT = int(os.environ.get("TELEGRAM_POLL_TIMEOUT", "30"))
 TELEGRAM_PROXY = os.environ.get("TELEGRAM_PROXY", "")
+WEB_PUSH_PROXY = os.environ.get("WEB_PUSH_PROXY", TELEGRAM_PROXY)
+PUBLIC_HOST = os.environ.get("PUBLIC_HOST", "")
+VAPID_SUBJECT = os.environ.get(
+    "POLMIRA_VAPID_SUBJECT",
+    f"https://{PUBLIC_HOST}" if PUBLIC_HOST else "https://localhost",
+)
 POLMIRA_RELAY_SECRET = os.environ.get("POLMIRA_RELAY_SECRET", "")
 POLMIRA_RELAY_BIND = os.environ.get("POLMIRA_RELAY_BIND", "172.17.0.1")
 POLMIRA_RELAY_PORT = int(os.environ.get("POLMIRA_RELAY_PORT", "8788"))
@@ -55,10 +75,29 @@ TELEGRAM_SEND_TIMEOUT = int(os.environ.get("TELEGRAM_SEND_TIMEOUT", "12"))
 PENDING_ACTIONS = {}
 INPUT_LOCKS = {}
 INPUT_LOCKS_GUARD = threading.Lock()
+NOTIFICATION_STATE_LOCK = threading.RLock()
+VAPID_LOCK = threading.Lock()
 MAX_INPUT_BYTES = int(os.environ.get("POLMIRA_INPUT_MAX_BYTES", str(64 * 1024)))
+MAX_PUSH_SUBSCRIPTION_BYTES = int(
+    os.environ.get("POLMIRA_PUSH_SUBSCRIPTION_MAX_BYTES", str(32 * 1024))
+)
+NOTIFICATION_MODES = {"telegram", "web", "both", "off"}
+NOTIFICATION_MODE_LABELS = {
+    "telegram": "Telegram",
+    "web": "Maxofon",
+    "both": "Telegram + Maxofon",
+    "off": "выключены",
+}
+PUSH_ENDPOINT_SUFFIXES = (
+    ".push.apple.com",
+    ".googleapis.com",
+    ".services.mozilla.com",
+    ".notify.windows.com",
+    ".microsoft.com",
+)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-LOCAL_POLMIRA = SCRIPT_DIR / "polmira-docker.sh"
+LOCAL_POLMIRA = SCRIPT_DIR / "polmira.sh"
 
 
 def install_socks5_proxy(proxy_url):
@@ -145,9 +184,6 @@ def allowed_files():
     candidates = [
         Path(configured) if configured else None,
         APP_DIR / "tg-allowed.txt",
-        Path("/opt/polmira-docker/tg-allowed.txt"),
-        Path("/opt/polmira-linux/tg-allowed.txt"),
-        Path("/opt/polmira/tg-allowed.txt"),
     ]
     seen = set()
 
@@ -210,7 +246,7 @@ def instance_env_for_tg(tg_id):
     if not wanted:
         return {}
 
-    for env_file in PHONES_DIR.glob("*/instance.env"):
+    for env_file in INSTANCES_DIR.glob("*/instance.env"):
         data = read_env_file(env_file)
         if data.get("TG_ID") == wanted:
             return data
@@ -224,9 +260,9 @@ def instance_env_for_username(username):
         return {}
 
     matches = []
-    for env_file in PHONES_DIR.glob("*/instance.env"):
+    for env_file in INSTANCES_DIR.glob("*/instance.env"):
         data = read_env_file(env_file)
-        if data.get("BACKEND") == "selkies" and data.get("USERNAME") == wanted:
+        if data.get("USERNAME") == wanted:
             matches.append(data)
 
     if len(matches) != 1:
@@ -244,6 +280,274 @@ def is_valid_relay_secret(tg_id, secret):
 
     return str(secret or "") == expected
 
+
+def empty_notification_state():
+    return {"version": 1, "users": {}}
+
+
+def load_notification_state_unlocked():
+    try:
+        data = json.loads(NOTIFICATION_STATE_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
+        if not isinstance(exc, FileNotFoundError):
+            print(f"Notification state read failed: {exc}", flush=True)
+        return empty_notification_state()
+
+    if not isinstance(data, dict) or not isinstance(data.get("users"), dict):
+        return empty_notification_state()
+
+    data["version"] = 1
+    return data
+
+
+def save_notification_state_unlocked(state):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".notification-routing-",
+        suffix=".json",
+        dir=STATE_DIR,
+    )
+
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+            json.dump(state, tmp, ensure_ascii=False, indent=2, sort_keys=True)
+            tmp.write("\n")
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, NOTIFICATION_STATE_FILE)
+    finally:
+        try:
+            Path(tmp_name).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def notification_profile(tg_id):
+    wanted = str(tg_id or "").strip()
+
+    with NOTIFICATION_STATE_LOCK:
+        state = load_notification_state_unlocked()
+        raw = state["users"].get(wanted, {})
+        mode = raw.get("mode", "telegram")
+        subscription = raw.get("subscription")
+
+    if mode not in NOTIFICATION_MODES:
+        mode = "telegram"
+    if not isinstance(subscription, dict):
+        subscription = None
+
+    return {"mode": mode, "subscription": subscription}
+
+
+def set_notification_mode(tg_id, mode):
+    wanted = str(tg_id or "").strip()
+    mode = str(mode or "").strip().lower()
+
+    if not wanted or mode not in NOTIFICATION_MODES:
+        raise ValueError("Bad notification mode")
+
+    with NOTIFICATION_STATE_LOCK:
+        state = load_notification_state_unlocked()
+        profile = state["users"].setdefault(wanted, {})
+        profile["mode"] = mode
+        profile["updated_at"] = int(time.time())
+        save_notification_state_unlocked(state)
+
+    return notification_profile(wanted)
+
+
+def push_endpoint_is_allowed(endpoint):
+    try:
+        parsed = urllib.parse.urlparse(str(endpoint or ""))
+    except ValueError:
+        return False
+
+    hostname = (parsed.hostname or "").lower()
+    return (
+        parsed.scheme == "https"
+        and bool(parsed.path)
+        and any(hostname.endswith(suffix) for suffix in PUSH_ENDPOINT_SUFFIXES)
+    )
+
+
+def normalize_push_subscription(raw):
+    if not isinstance(raw, dict):
+        raise ValueError("Subscription must be an object")
+
+    endpoint = str(raw.get("endpoint") or "").strip()
+    keys = raw.get("keys")
+
+    if (
+        len(endpoint) > 4096
+        or not push_endpoint_is_allowed(endpoint)
+        or not isinstance(keys, dict)
+    ):
+        raise ValueError("Invalid push endpoint")
+
+    p256dh = str(keys.get("p256dh") or "").strip()
+    auth = str(keys.get("auth") or "").strip()
+    base64url_pattern = re.compile(r"^[A-Za-z0-9_-]+={0,2}$")
+
+    if (
+        not 40 <= len(p256dh) <= 256
+        or not 8 <= len(auth) <= 128
+        or not base64url_pattern.fullmatch(p256dh)
+        or not base64url_pattern.fullmatch(auth)
+    ):
+        raise ValueError("Invalid push keys")
+
+    return {
+        "endpoint": endpoint,
+        "expirationTime": raw.get("expirationTime"),
+        "keys": {"p256dh": p256dh, "auth": auth},
+    }
+
+
+def set_push_subscription(tg_id, subscription):
+    wanted = str(tg_id or "").strip()
+    subscription = normalize_push_subscription(subscription)
+
+    with NOTIFICATION_STATE_LOCK:
+        state = load_notification_state_unlocked()
+        profile = state["users"].setdefault(wanted, {})
+        profile.setdefault("mode", "telegram")
+        profile["subscription"] = subscription
+        profile["subscription_updated_at"] = int(time.time())
+        profile["updated_at"] = int(time.time())
+        save_notification_state_unlocked(state)
+
+    return notification_profile(wanted)
+
+
+def remove_push_subscription(tg_id, endpoint=None):
+    wanted = str(tg_id or "").strip()
+
+    with NOTIFICATION_STATE_LOCK:
+        state = load_notification_state_unlocked()
+        profile = state["users"].get(wanted)
+
+        if not isinstance(profile, dict):
+            return
+
+        current = profile.get("subscription")
+        if (
+            endpoint
+            and isinstance(current, dict)
+            and current.get("endpoint") != endpoint
+        ):
+            return
+
+        profile.pop("subscription", None)
+        profile.pop("subscription_updated_at", None)
+        profile["updated_at"] = int(time.time())
+        save_notification_state_unlocked(state)
+
+
+def delete_notification_profile(tg_id):
+    wanted = str(tg_id or "").strip()
+
+    with NOTIFICATION_STATE_LOCK:
+        state = load_notification_state_unlocked()
+        if state["users"].pop(wanted, None) is not None:
+            save_notification_state_unlocked(state)
+
+
+def ensure_vapid_keys():
+    with VAPID_LOCK:
+        try:
+            private_exists = VAPID_PRIVATE_KEY_FILE.is_file()
+            public_key = VAPID_PUBLIC_KEY_FILE.read_text(encoding="ascii").strip()
+            if private_exists and public_key:
+                return public_key
+        except (FileNotFoundError, OSError):
+            pass
+
+        if ec is None or serialization is None:
+            raise RuntimeError("Web Push dependencies are not installed")
+
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        private_pem = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        public_raw = private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.X962,
+            format=serialization.PublicFormat.UncompressedPoint,
+        )
+        public_key = base64.urlsafe_b64encode(public_raw).rstrip(b"=").decode("ascii")
+
+        private_tmp = VAPID_PRIVATE_KEY_FILE.with_suffix(".pem.tmp")
+        public_tmp = VAPID_PUBLIC_KEY_FILE.with_suffix(".txt.tmp")
+        private_tmp.write_bytes(private_pem)
+        public_tmp.write_text(public_key + "\n", encoding="ascii")
+        os.chmod(private_tmp, 0o600)
+        os.chmod(public_tmp, 0o644)
+        os.replace(private_tmp, VAPID_PRIVATE_KEY_FILE)
+        os.replace(public_tmp, VAPID_PUBLIC_KEY_FILE)
+        return public_key
+
+
+def web_push_payload(text):
+    lines = str(text or "").strip().splitlines()
+
+    if lines and lines[0].strip().lower() == "maxofon":
+        lines = lines[1:]
+
+    body = "\n".join(lines).strip() or "Новое сообщение в MAX"
+    return json.dumps(
+        {
+            "title": "Maxofon",
+            "body": body[:3500],
+            "tag": f"maxofon-{time.time_ns()}",
+        },
+        ensure_ascii=False,
+    )
+
+
+def send_web_push(tg_id, text):
+    if webpush is None:
+        raise RuntimeError("pywebpush is not installed")
+
+    profile = notification_profile(tg_id)
+    subscription = profile.get("subscription")
+
+    if not subscription:
+        raise RuntimeError("Web Push subscription is missing")
+
+    ensure_vapid_keys()
+
+    try:
+        webpush(
+            subscription_info=subscription,
+            data=web_push_payload(text),
+            vapid_private_key=str(VAPID_PRIVATE_KEY_FILE),
+            vapid_claims={"sub": VAPID_SUBJECT},
+            ttl=300,
+            timeout=15,
+            headers={"Urgency": "high"},
+        )
+    except Exception as exc:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if status_code in {404, 410}:
+            remove_push_subscription(tg_id, subscription.get("endpoint"))
+        raise
+
+
+def deliver_max_notification(tg_id, text):
+    profile = notification_profile(tg_id)
+    mode = profile["mode"]
+
+    if mode in {"telegram", "both"}:
+        send_message_async(tg_id, text)
+
+    if mode in {"web", "both"}:
+        send_web_push_async(tg_id, text)
+
+
 if TELEGRAM_PROXY and install_socks5_proxy(TELEGRAM_PROXY):
     opener = urllib.request.build_opener()
     urllib.request.install_opener(opener)
@@ -254,8 +558,12 @@ elif TELEGRAM_PROXY:
     })
     urllib.request.install_opener(urllib.request.build_opener(proxy_handler))
 
+if WEB_PUSH_PROXY:
+    os.environ.setdefault("HTTP_PROXY", WEB_PUSH_PROXY)
+    os.environ.setdefault("HTTPS_PROXY", WEB_PUSH_PROXY)
 
-PHONE_MENU = {
+
+INSTANCE_MENU = {
     "inline_keyboard": [
         [
             {"text": "Включить / перезагрузить", "callback_data": "start"},
@@ -266,6 +574,9 @@ PHONE_MENU = {
         ],
         [
             {"text": "Face ID / Passkey", "callback_data": "passkey_help"},
+        ],
+        [
+            {"text": "Куда слать уведомления", "callback_data": "notifications"},
         ],
         [
             {"text": "Удалить", "callback_data": "delete_confirm"},
@@ -284,6 +595,41 @@ DELETE_CONFIRM_MENU = {
         [{"text": "Отмена", "callback_data": "refresh"}],
     ]
 }
+
+
+def notification_menu(tg_id):
+    profile = notification_profile(tg_id)
+    current = profile["mode"]
+
+    def label(mode, text):
+        return f"[выбрано] {text}" if current == mode else text
+
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": label("telegram", "Telegram"),
+                    "callback_data": "notify:telegram",
+                },
+                {
+                    "text": label("web", "Maxofon"),
+                    "callback_data": "notify:web",
+                },
+            ],
+            [
+                {
+                    "text": label("both", "Telegram + Maxofon"),
+                    "callback_data": "notify:both",
+                },
+                {
+                    "text": label("off", "Выключить"),
+                    "callback_data": "notify:off",
+                },
+            ],
+            [{"text": "Назад", "callback_data": "refresh"}],
+        ]
+    }
+
 
 def api(method, payload=None, timeout=None, retries=None):
     if not BOT_TOKEN:
@@ -338,7 +684,12 @@ def send_message(chat_id, text, reply_markup=None):
     if reply_markup:
         payload["reply_markup"] = reply_markup
 
-    return api("sendMessage", payload, timeout=TELEGRAM_SEND_TIMEOUT)
+    return api(
+        "sendMessage",
+        payload,
+        timeout=TELEGRAM_SEND_TIMEOUT,
+        retries=1,
+    )
 
 
 def safe_send_message(chat_id, text, reply_markup=None):
@@ -373,12 +724,22 @@ def send_telegram_file(chat_id, path, filename, caption, mime_type):
     return multipart_api(method, fields, {field: (path, filename, mime_type)})
 
 
-def send_message_async(chat_id, text):
+def send_message_async(chat_id, text, reply_markup=None):
     def worker():
         try:
-            send_message(chat_id, text)
+            send_message(chat_id, text, reply_markup)
         except Exception as exc:
             print(f"Relay async message error: {exc}", flush=True)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def send_web_push_async(tg_id, text):
+    def worker():
+        try:
+            send_web_push(tg_id, text)
+        except Exception as exc:
+            print(f"Web Push send failed for tg_id={tg_id}: {exc}", flush=True)
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -402,6 +763,14 @@ class RelayHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return
 
+    def do_GET(self):
+        if self.path == "/push/public-key":
+            self.handle_push_public_key()
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
     def do_POST(self):
         if self.path == "/notify":
             self.handle_notify()
@@ -415,8 +784,105 @@ class RelayHandler(BaseHTTPRequestHandler):
             self.handle_input()
             return
 
+        if self.path == "/push/subscribe":
+            self.handle_push_subscribe()
+            return
+
         self.send_response(404)
         self.end_headers()
+
+    def do_DELETE(self):
+        if self.path == "/push/subscribe":
+            self.handle_push_unsubscribe()
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def relay_identity(self):
+        tg_id = str(self.headers.get("X-Polmira-Tg-Id") or "").strip()
+        secret = str(self.headers.get("X-Polmira-Secret") or "")
+
+        if (
+            not tg_id
+            or not is_allowed_tg(tg_id)
+            or not is_valid_relay_secret(tg_id, secret)
+        ):
+            return None
+
+        return tg_id
+
+    def send_json(self, status, payload):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def handle_push_public_key(self):
+        try:
+            tg_id = self.relay_identity()
+            if not tg_id:
+                self.send_response(403)
+                self.end_headers()
+                return
+
+            self.send_json(200, {"publicKey": ensure_vapid_keys()})
+        except Exception as exc:
+            print(f"Push public key error: {exc}", flush=True)
+            self.send_response(500)
+            self.end_headers()
+
+    def handle_push_subscribe(self):
+        try:
+            tg_id = self.relay_identity()
+            length = int(self.headers.get("Content-Length", "0"))
+
+            if not tg_id:
+                self.send_response(403)
+                self.end_headers()
+                return
+
+            if length <= 0 or length > MAX_PUSH_SUBSCRIPTION_BYTES:
+                self.send_response(413 if length > MAX_PUSH_SUBSCRIPTION_BYTES else 400)
+                self.end_headers()
+                return
+
+            subscription = json.loads(self.rfile.read(length).decode("utf-8"))
+            profile = set_push_subscription(tg_id, subscription)
+            self.send_json(
+                200,
+                {
+                    "subscribed": True,
+                    "mode": profile["mode"],
+                },
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            print(f"Push subscribe rejected: {exc}", flush=True)
+            self.send_response(400)
+            self.end_headers()
+        except Exception as exc:
+            print(f"Push subscribe error: {exc}", flush=True)
+            self.send_response(500)
+            self.end_headers()
+
+    def handle_push_unsubscribe(self):
+        try:
+            tg_id = self.relay_identity()
+            if not tg_id:
+                self.send_response(403)
+                self.end_headers()
+                return
+
+            remove_push_subscription(tg_id)
+            self.send_response(204)
+            self.end_headers()
+        except Exception as exc:
+            print(f"Push unsubscribe error: {exc}", flush=True)
+            self.send_response(500)
+            self.end_headers()
 
     def handle_input(self):
         try:
@@ -477,7 +943,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
 
-            send_message_async(tg_id, text)
+            deliver_max_notification(tg_id, text)
             self.send_response(204)
             self.end_headers()
         except Exception as exc:
@@ -581,10 +1047,10 @@ def start_authelia_notifier():
             return None
 
     def worker():
-        last_signature = file_signature()
+        last_signature = None
 
         while True:
-            time.sleep(1)
+            time.sleep(0.1)
             signature = file_signature()
             if signature is None or signature == last_signature:
                 continue
@@ -638,6 +1104,14 @@ def safe_answer_callback(callback_id, text=""):
     except Exception as exc:
         print(f"answerCallbackQuery failed: {exc}", flush=True)
         return None
+
+
+def answer_callback_async(callback_id, text=""):
+    threading.Thread(
+        target=safe_answer_callback,
+        args=(callback_id, text),
+        daemon=True,
+    ).start()
 
 
 def multipart_api(method, fields, files):
@@ -762,10 +1236,12 @@ def status_for_user(tg_id):
     return output, parse_env_output(output)
 
 
-def render_phone_status(info):
+def render_instance_status(info):
+    tg_id = info.get("TG_ID", "")
+    notifications = notification_profile(tg_id) if tg_id else {"mode": "telegram"}
     lines = [
         "Твой MAX-контейнер готов.",
-        f"Контейнер: {info.get('CONTAINER_NAME') or info.get('PHONE_NAME', '-')}",
+        f"Контейнер: {info.get('CONTAINER_NAME', '-')}",
         f"Логин: {info.get('USERNAME', '-')}",
     ]
 
@@ -775,6 +1251,8 @@ def render_phone_status(info):
     lines.extend([
         f"Статус: {info.get('INIT_STATUS', '-')}",
         f"web: {info.get('WEB_STATUS', '-')} / ready: {info.get('WEB_READY', '-')}",
+        "Уведомления: "
+        f"{NOTIFICATION_MODE_LABELS.get(notifications['mode'], 'Telegram')}",
         "",
         "Ссылка:",
         info.get("URL", "-"),
@@ -796,17 +1274,17 @@ def show_entry_menu(chat_id, tg_id):
         send_message(chat_id, f"Не смог проверить доступ:\n{text}")
         return
 
-    if info.get("NO_PHONE") == "1":
+    if info.get("NO_INSTANCE") == "1":
         send_message(chat_id, "Доступ есть. MAX-контейнер ещё не создан.", CREATE_MENU)
     else:
-        send_message(chat_id, render_phone_status(info), PHONE_MENU)
+        send_message(chat_id, render_instance_status(info), INSTANCE_MENU)
 
 
 def handle_create(chat_id, tg_id):
     safe_send_message(chat_id, "Создаю MAX-контейнер. Первый запуск может занять несколько минут...")
 
     try:
-        output = run_polmira("bot-create-phone", str(tg_id))
+        output = run_polmira("bot-create", str(tg_id))
     except RuntimeError as exc:
         send_message(chat_id, f"Не получилось создать MAX-контейнер:\n{exc}")
         return
@@ -814,16 +1292,16 @@ def handle_create(chat_id, tg_id):
     info = parse_env_output(output)
 
     if info.get("URL"):
-        send_message(chat_id, render_phone_status(info), PHONE_MENU)
+        send_message(chat_id, render_instance_status(info), INSTANCE_MENU)
     else:
         lines = [line for line in output.splitlines() if line.strip()]
-        send_message(chat_id, "\n".join(lines[-10:]), PHONE_MENU)
+        send_message(chat_id, "\n".join(lines[-10:]), INSTANCE_MENU)
 
 
 def handle_action(chat_id, tg_id, action):
     mapping = {
-        "start": ("bot-start-phone", "Запускаю сессию..."),
-        "stop": ("bot-stop-phone", "Выключаю сессию..."),
+        "start": ("bot-start", "Запускаю сессию..."),
+        "stop": ("bot-stop", "Выключаю сессию..."),
     }
 
     if action not in mapping:
@@ -842,9 +1320,9 @@ def handle_action(chat_id, tg_id, action):
     info = parse_env_output(output)
 
     if info:
-        send_message(chat_id, render_phone_status(info), PHONE_MENU)
+        send_message(chat_id, render_instance_status(info), INSTANCE_MENU)
     else:
-        send_message(chat_id, output or "Готово.", PHONE_MENU)
+        send_message(chat_id, output or "Готово.", INSTANCE_MENU)
 
 
 def handle_change_credentials(chat_id, tg_id):
@@ -857,62 +1335,101 @@ def handle_change_credentials(chat_id, tg_id):
     )
 
 
+def handle_notification_menu(chat_id, tg_id):
+    profile = notification_profile(tg_id)
+    subscribed = "подключён" if profile.get("subscription") else "не подключён"
+    send_message_async(
+        chat_id,
+        "Куда отправлять сообщения-уведомления MAX?\n\n"
+        f"Сейчас: {NOTIFICATION_MODE_LABELS[profile['mode']]}\n"
+        f"Web Push Maxofon: {subscribed}\n\n"
+        "Для Maxofon сначала открой PWA с домашнего экрана и нажми "
+        "«Включить уведомления».",
+        notification_menu(tg_id),
+    )
+
+
+def handle_notification_mode(chat_id, tg_id, mode):
+    try:
+        profile = set_notification_mode(tg_id, mode)
+    except ValueError:
+        send_message_async(chat_id, "Неизвестный режим уведомлений.", INSTANCE_MENU)
+        return
+
+    lines = [
+        "Режим уведомлений изменён:",
+        NOTIFICATION_MODE_LABELS[profile["mode"]],
+    ]
+
+    if mode in {"web", "both"} and not profile.get("subscription"):
+        lines.extend(
+            [
+                "",
+                "Web Push ещё не подключён. Открой Maxofon с домашнего экрана "
+                "и нажми «Включить уведомления».",
+            ]
+        )
+
+    send_message_async(chat_id, "\n".join(lines), notification_menu(tg_id))
+
+
 def complete_change_credentials(chat_id, tg_id, text):
     parts = text.split(maxsplit=1)
 
     if len(parts) != 2:
-        send_message(chat_id, "Нужно одной строкой: логин пароль", PHONE_MENU)
+        send_message(chat_id, "Нужно одной строкой: логин пароль", INSTANCE_MENU)
         return
 
     username, password = parts[0].strip(), parts[1].strip()
 
     if not re.match(r"^[A-Za-z0-9_.-]{1,64}$", username):
-        send_message(chat_id, "Логин должен быть: A-Z, a-z, 0-9, точка, дефис или подчёркивание.", PHONE_MENU)
+        send_message(chat_id, "Логин должен быть: A-Z, a-z, 0-9, точка, дефис или подчёркивание.", INSTANCE_MENU)
         return
 
     if len(password) < 4:
-        send_message(chat_id, "Пароль слишком короткий, дай хотя бы 4 символа.", PHONE_MENU)
+        send_message(chat_id, "Пароль слишком короткий, дай хотя бы 4 символа.", INSTANCE_MENU)
         return
 
     try:
         output = run_polmira("bot-set-password", str(tg_id), username, password)
     except RuntimeError as exc:
         PENDING_ACTIONS.pop(str(tg_id), None)
-        send_message(chat_id, f"Не получилось сменить логин/пароль:\n{exc}", PHONE_MENU)
+        send_message(chat_id, f"Не получилось сменить логин/пароль:\n{exc}", INSTANCE_MENU)
         return
 
     PENDING_ACTIONS.pop(str(tg_id), None)
     info = parse_env_output(output)
     info["PASSWORD"] = password
-    send_message(chat_id, render_phone_status(info), PHONE_MENU)
+    send_message(chat_id, render_instance_status(info), INSTANCE_MENU)
 
 
 def handle_delete(chat_id, tg_id):
     try:
-        output = run_polmira("bot-delete-phone", str(tg_id))
+        output = run_polmira("bot-delete", str(tg_id))
     except RuntimeError as exc:
         send_message(chat_id, f"Не получилось удалить MAX-контейнер:\n{exc}")
         return
 
+    delete_notification_profile(tg_id)
     safe_send_message(chat_id, output or "MAX-контейнер удалён.", CREATE_MENU)
 
 
 def cancel_pending(chat_id, tg_id):
     PENDING_ACTIONS.pop(str(tg_id), None)
-    send_message(chat_id, "Отменено.", PHONE_MENU)
+    send_message(chat_id, "Отменено.", INSTANCE_MENU)
 
 
-def phone_dir_for_tg_id(tg_id):
+def instance_dir_for_tg_id(tg_id):
     wanted = str(tg_id)
 
-    for phone_dir in sorted(PHONES_DIR.glob("*")):
-        if not phone_dir.is_dir():
+    for instance_dir in sorted(INSTANCES_DIR.glob("*")):
+        if not instance_dir.is_dir():
             continue
 
-        env = read_phone_env(phone_dir / "instance.env")
+        env = read_instance_env(instance_dir / "instance.env")
 
         if env.get("TG_ID") == wanted:
-            return phone_dir
+            return instance_dir
 
     return None
 
@@ -993,20 +1510,24 @@ def download_telegram_file(file_id):
     return data, file_path
 
 
-def save_message_file_to_phone(tg_id, message):
-    phone_dir = phone_dir_for_tg_id(tg_id)
+def save_message_file_to_instance(tg_id, message):
+    instance_dir = instance_dir_for_tg_id(tg_id)
 
-    if phone_dir is None:
+    if instance_dir is None:
         raise RuntimeError("MAX-контейнер для этого Telegram ID не найден")
 
-    env = read_phone_env(phone_dir / "instance.env")
+    instance_dir = instance_dir.resolve()
+    env = read_instance_env(instance_dir / "instance.env")
     file_id, original_name, kind, mime_type = media_from_message(message)
 
     if not file_id:
         raise RuntimeError("Не нашёл файл в сообщении")
 
     data, telegram_path = download_telegram_file(file_id)
-    max_dir = Path(env.get("DOWNLOADS_DIR") or phone_dir / "downloads")
+    owner_downloads = (instance_dir / "selkies-home" / "Downloads").resolve()
+    max_dir = Path(env.get("DOWNLOADS_DIR") or owner_downloads).resolve()
+    if max_dir != owner_downloads and not max_dir.is_relative_to(owner_downloads):
+        raise RuntimeError("Каталог загрузок вышел за пределы профиля владельца")
 
     max_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1024,15 +1545,15 @@ def save_message_file_to_phone(tg_id, message):
 
 def handle_file_message(chat_id, tg_id, message):
     try:
-        path = save_message_file_to_phone(tg_id, message)
+        path = save_message_file_to_instance(tg_id, message)
     except RuntimeError as exc:
-        send_message(chat_id, f"Не получилось сохранить файл:\n{exc}", PHONE_MENU)
+        send_message(chat_id, f"Не получилось сохранить файл:\n{exc}", INSTANCE_MENU)
         return
 
-    send_message(chat_id, f"Сохранил в Downloads:\n{path.name}", PHONE_MENU)
+    send_message(chat_id, f"Сохранил в Downloads:\n{path.name}", INSTANCE_MENU)
 
 
-def read_phone_env(path):
+def read_instance_env(path):
     data = {}
 
     if not path.exists():
@@ -1052,7 +1573,7 @@ def handle_callback(callback):
     chat_id = message.get("chat", {}).get("id")
     tg_id = callback.get("from", {}).get("id")
 
-    safe_answer_callback(callback["id"])
+    answer_callback_async(callback["id"])
 
     if not chat_id or not tg_id:
         return
@@ -1068,28 +1589,20 @@ def handle_callback(callback):
     elif data == "refresh":
         PENDING_ACTIONS.pop(str(tg_id), None)
         show_entry_menu(chat_id, tg_id)
-    elif data == "install":
-        send_message(chat_id, "MAX теперь ставится внутри контейнера автоматически. Открой меню заново: /start")
     elif data in {"change_credentials", "change_password"}:
         handle_change_credentials(chat_id, tg_id)
     elif data == "passkey_help":
-        instance = instance_env_for_tg(tg_id)
-        if instance.get("BACKEND") != "selkies":
-            send_message(
-                chat_id,
-                "Face ID / Passkey доступен для новых Selkies-контейнеров.",
-                PHONE_MENU,
-            )
-        else:
-            send_message(
-                chat_id,
-                "Открой ссылку MAX, войди по логину и паролю, затем выбери "
-                "«Методы» → «Секретный ключ - WebAuthn» → «Регистрация устройства». "
-                "Одноразовый код подтверждения придёт сюда.",
-                PHONE_MENU,
-            )
-    elif data.startswith("app:"):
-        send_message(chat_id, "Эта команда больше не используется. Открой меню заново: /start")
+        send_message(
+            chat_id,
+            "Открой ссылку MAX, войди по логину и паролю, затем выбери "
+            "«Методы» → «Секретный ключ - WebAuthn» → «Регистрация устройства». "
+            "Одноразовый код подтверждения придёт сюда.",
+            INSTANCE_MENU,
+        )
+    elif data == "notifications":
+        handle_notification_menu(chat_id, tg_id)
+    elif data.startswith("notify:"):
+        handle_notification_mode(chat_id, tg_id, data.split(":", 1)[1])
     elif data == "delete_confirm":
         send_message(chat_id, "Удалить MAX-контейнер и его данные?", DELETE_CONFIRM_MENU)
     elif data == "delete":

@@ -19,7 +19,6 @@ TG_ID = os.environ.get("TG_ID", "")
 TELEGRAM_PROXY = os.environ.get("TELEGRAM_PROXY", "")
 POLMIRA_RELAY_URL = os.environ.get("POLMIRA_RELAY_URL", "")
 POLMIRA_RELAY_SECRET = os.environ.get("POLMIRA_RELAY_SECRET", "")
-PHONE_NAME = os.environ.get("PHONE_NAME", "")
 TARGET_HINT = os.environ.get("NOTIFY_TARGET_HINT", "MAX").lower()
 FORCE_IPV4 = os.environ.get("TELEGRAM_FORCE_IPV4", "yes").lower() in {"1", "yes", "true", "on"}
 

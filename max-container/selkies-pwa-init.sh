@@ -10,6 +10,8 @@ manifest_path = Path("/usr/share/selkies/web/manifest.json")
 index_path = Path("/usr/share/selkies/web/index.html")
 bridge_source_path = Path("/usr/share/selkies/www/polmira-mobile.js")
 bridge_web_path = Path("/usr/share/selkies/web/polmira-mobile.js")
+service_worker_source_path = Path("/usr/share/selkies/www/polmira-sw.js")
+service_worker_web_path = Path("/usr/share/selkies/web/polmira-sw.js")
 opus_worker_source_path = Path("/usr/share/selkies/www/polmira-opus-worker.js")
 opus_worker_web_path = Path("/usr/share/selkies/web/polmira-opus-worker.js")
 opus_decoder_source_path = Path("/usr/share/selkies/www/opus-decoder.min.js")
@@ -23,6 +25,8 @@ if not subfolder.endswith("/"):
 
 if bridge_source_path.exists():
     bridge_web_path.write_bytes(bridge_source_path.read_bytes())
+if service_worker_source_path.exists():
+    service_worker_web_path.write_bytes(service_worker_source_path.read_bytes())
 if opus_worker_source_path.exists():
     opus_worker_web_path.write_bytes(opus_worker_source_path.read_bytes())
 if opus_decoder_source_path.exists():
@@ -58,7 +62,7 @@ if index_path.exists():
     html = index_path.read_text(encoding="utf-8")
     if "<title>" not in html:
         html = html.replace("<head>", "<head><title>Maxofon</title>", 1)
-    bridge_tag = '<script src="./polmira-mobile.js?v=20260723-mobile5"></script>'
+    bridge_tag = '<script src="./polmira-mobile.js?v=20260723-mobile6"></script>'
     if bridge_tag not in html:
         html = html.replace(
             '<script type="module"',

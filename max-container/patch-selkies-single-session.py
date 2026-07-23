@@ -61,16 +61,16 @@ source = replace_once(
                                         set(),
                                     )
                                     self._maxofon_revoked_client_ids = revoked_ids
-                                    legacy_blocked = getattr(
+                                    unidentified_clients_blocked = getattr(
                                         self,
-                                        '_maxofon_legacy_clients_blocked',
+                                        '_maxofon_unidentified_clients_blocked',
                                         True,
                                     )
                                     if (
                                         maxofon_client_id in revoked_ids
                                         or (
                                             not maxofon_client_id
-                                            and legacy_blocked
+                                            and unidentified_clients_blocked
                                         )
                                     ):
                                         data_logger.warning(
@@ -88,7 +88,7 @@ source = replace_once(
                                             pass
                                         return
                                     if maxofon_client_id:
-                                        self._maxofon_legacy_clients_blocked = True
+                                        self._maxofon_unidentified_clients_blocked = True
 
                                 existing_client_info = self.display_clients.get(display_id)
 """,

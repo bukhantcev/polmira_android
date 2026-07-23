@@ -43,9 +43,10 @@ COPY max-container/selkies-session.sh /usr/local/bin/polmira-selkies-session
 COPY max-container/patch-selkies-single-session.py /tmp/patch-selkies-single-session.py
 COPY max-container/selkies-pwa-init.sh /custom-cont-init.d/50-polmira-pwa
 COPY max-container/selkies-mobile-bridge.js /usr/share/selkies/www/polmira-mobile.js
+COPY max-container/selkies-service-worker.js /usr/share/selkies/www/polmira-sw.js
 COPY max-container/selkies-opus-worker.js /usr/share/selkies/www/polmira-opus-worker.js
 COPY max-container/opus-decoder.min.js /usr/share/selkies/www/opus-decoder.min.js
-COPY ios/MaxofonClient/Assets.xcassets/AppIcon.appiconset/Icon-1024.png /usr/share/selkies/www/icon.png
+COPY max-container/icon.png /usr/share/selkies/www/icon.png
 
 RUN python3 /tmp/patch-selkies-single-session.py \
     && rm /tmp/patch-selkies-single-session.py \

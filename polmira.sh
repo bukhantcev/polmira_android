@@ -1,22 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_DIR="/opt/polmira-docker"
+APP_DIR="${POLMIRA_APP_DIR:-/opt/polmira-docker}"
 INSTANCES_DIR="$APP_DIR/instances"
 CONFIG_FILE="$APP_DIR/config.env"
 TG_ALLOWED_FILE="$APP_DIR/tg-allowed.txt"
 BOT_ENV_FILE="$APP_DIR/bot/.env"
-NGINX_SITE="/etc/nginx/sites-available/polmira-docker"
-NGINX_SITE_LINK="/etc/nginx/sites-enabled/polmira-docker"
-NGINX_SNIPPETS_DIR="/etc/nginx/polmira-docker"
-IMAGE="${POLMIRA_MAX_IMAGE:-chtotos/polmira_max:latest}"
-SELKIES_IMAGE="${POLMIRA_SELKIES_IMAGE:-chtotos/polmira_max_selkies:2026.07.23-mobile5}"
-SELKIES_SOURCE_ARCHIVE="${POLMIRA_SELKIES_SOURCE_ARCHIVE:-https://github.com/bukhantcev/polmira_android/archive/refs/heads/master.tar.gz}"
+NGINX_ROOT="${POLMIRA_NGINX_ROOT:-/etc/nginx}"
+NGINX_SITE="$NGINX_ROOT/sites-available/polmira"
+NGINX_SITE_LINK="$NGINX_ROOT/sites-enabled/polmira"
+NGINX_SNIPPETS_DIR="$NGINX_ROOT/polmira"
+MAX_IMAGE="${POLMIRA_MAX_IMAGE:-chtotos/polmira_max_selkies:2026.07.23-unified1}"
+BOT_IMAGE="${POLMIRA_BOT_IMAGE:-chtotos/polmira_bot:2026.07.23-unified1}"
+SOURCE_ARCHIVE="${POLMIRA_SOURCE_ARCHIVE:-https://github.com/bukhantcev/polmira_android/archive/refs/heads/master.tar.gz}"
 AUTHELIA_IMAGE="${POLMIRA_AUTHELIA_IMAGE:-authelia/authelia:4.39.20}"
 AUTHELIA_DIR="$APP_DIR/authelia"
 AUTHELIA_CONTAINER="polmira-authelia"
 AUTHELIA_PORT=9091
 MAX_CPUS="${POLMIRA_MAX_CPUS:-0.75}"
+MAX_MEMORY="${POLMIRA_MAX_MEMORY:-2g}"
 WEB_RANGE_START=6200
 WEB_RANGE_END=6299
 PUBLIC_HOST=""
@@ -40,6 +42,45 @@ need_root() {
 
 exists() {
     command -v "$1" >/dev/null 2>&1
+}
+
+canonical_path() {
+    python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"
+}
+
+install_self() {
+    local source_path
+
+    source_path="$(canonical_path "$0")"
+    if [ "$source_path" != "/usr/local/bin/polmira" ]; then
+        install -m 0755 "$source_path" /usr/local/bin/polmira
+    fi
+}
+
+install_host_dependencies() {
+    if [ "$(uname -m)" != "x86_64" ]; then
+        say_red "MAX для Linux требует сервер amd64/x86_64"
+        return 1
+    fi
+
+    if ! exists apt-get; then
+        say_red "Автоматическая установка поддерживает Debian/Ubuntu с apt"
+        return 1
+    fi
+
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        apache2-utils \
+        ca-certificates \
+        curl \
+        nginx \
+        openssl \
+        python3
+    if ! exists docker; then
+        apt-get install -y --no-install-recommends docker.io
+    fi
+    systemctl enable --now docker nginx
 }
 
 systemctl() {
@@ -136,8 +177,15 @@ nginx_cmd() {
 }
 
 create_dirs() {
-    mkdir -p "$APP_DIR" "$INSTANCES_DIR" "$NGINX_SNIPPETS_DIR" "$APP_DIR/bot" "$AUTHELIA_DIR"
+    mkdir -p \
+        "$APP_DIR" \
+        "$APP_DIR/bot" \
+        "$APP_DIR/state" \
+        "$INSTANCES_DIR" \
+        "$NGINX_SNIPPETS_DIR" \
+        "$AUTHELIA_DIR"
     touch "$TG_ALLOWED_FILE"
+    chmod 700 "$APP_DIR/state"
 }
 
 load_config() {
@@ -159,7 +207,7 @@ load_config() {
 
 require_public_host() {
     if [ -z "${PUBLIC_HOST:-}" ]; then
-        say_red "PUBLIC_HOST не задан. Запусти: polmira-docker install"
+        say_red "PUBLIC_HOST не задан. Запусти: polmira install"
         return 1
     fi
 }
@@ -169,14 +217,22 @@ configure_public_access() {
 
     local value
     if [ -z "${PUBLIC_HOST:-}" ]; then
-        read -r -p "Домен для noVNC/API, например max.example.com: " value
+        read -r -p "Домен Maxofon, например max.example.com: " value
         PUBLIC_HOST="$value"
     fi
 
     require_public_host
+    if ! [[ "$PUBLIC_HOST" =~ ^[A-Za-z0-9.-]+$ ]]; then
+        say_red "Некорректный домен"
+        return 1
+    fi
 
     read -r -p "Использовать HTTPS? [yes/no] (${USE_HTTPS:-yes}): " value
     USE_HTTPS="${value:-${USE_HTTPS:-yes}}"
+    if [ "$USE_HTTPS" != "yes" ] && [ "$USE_HTTPS" != "no" ]; then
+        say_red "USE_HTTPS должен быть yes или no"
+        return 1
+    fi
 
     if [ "$USE_HTTPS" = "yes" ]; then
         local default_cert default_key
@@ -188,6 +244,13 @@ configure_public_access() {
 
         read -r -p "Путь к SSL key (${SSL_KEY:-$default_key}): " value
         SSL_KEY="${value:-${SSL_KEY:-$default_key}}"
+        if ! [[ "$SSL_CERT" =~ ^/[A-Za-z0-9._/-]+$ ]] \
+            || ! [[ "$SSL_KEY" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+            say_red "Некорректный путь к сертификату"
+            return 1
+        fi
+        [ -f "$SSL_CERT" ] || { say_red "Сертификат не найден: $SSL_CERT"; return 1; }
+        [ -f "$SSL_KEY" ] || { say_red "Ключ не найден: $SSL_KEY"; return 1; }
     else
         SSL_CERT=""
         SSL_KEY=""
@@ -213,6 +276,46 @@ load_bot_env_value() {
     if [ -f "$file" ]; then
         awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); gsub(/^["'\'']|["'\'']$/, ""); print; exit}' "$file"
     fi
+}
+
+configure_bot() {
+    local current_token current_proxy current_relay token proxy relay_secret
+
+    create_dirs
+    current_token="$(load_bot_env_value TELEGRAM_BOT_TOKEN || true)"
+    current_proxy="$(load_bot_env_value TELEGRAM_PROXY || true)"
+    current_relay="$(load_bot_env_value POLMIRA_RELAY_SECRET || true)"
+    token="${POLMIRA_TELEGRAM_BOT_TOKEN:-$current_token}"
+    proxy="${POLMIRA_TELEGRAM_PROXY:-$current_proxy}"
+    relay_secret="$current_relay"
+
+    if [ -z "$token" ]; then
+        read -r -s -p "Telegram bot token: " token
+        echo
+    fi
+    if [ -z "$token" ]; then
+        say_red "Telegram bot token пустой"
+        return 1
+    fi
+
+    if [ -t 0 ] && [ -z "${POLMIRA_TELEGRAM_PROXY+x}" ]; then
+        local entered_proxy
+        read -r -p "HTTP/SOCKS proxy для Telegram и Web Push (${current_proxy:-без proxy}): " entered_proxy
+        proxy="${entered_proxy:-$current_proxy}"
+    fi
+    relay_secret="${relay_secret:-$(openssl rand -hex 24)}"
+
+    cat > "$BOT_ENV_FILE" <<EOF
+TELEGRAM_BOT_TOKEN=${token}
+TELEGRAM_PROXY=${proxy}
+WEB_PUSH_PROXY=${proxy}
+PUBLIC_HOST=${PUBLIC_HOST}
+POLMIRA_ALLOWED_FILE=${TG_ALLOWED_FILE}
+POLMIRA_RELAY_SECRET=${relay_secret}
+POLMIRA_RELAY_BIND=172.17.0.1
+POLMIRA_RELAY_PORT=8788
+EOF
+    chmod 600 "$BOT_ENV_FILE"
 }
 
 ensure_relay_secret() {
@@ -242,25 +345,9 @@ public_base_url() {
     fi
 }
 
-novnc_url() {
-    local web_path="$1"
-    echo "$(public_base_url)${web_path}vnc.html?autoconnect=1&resize=scale&shared=0&path=${web_path#/}"
-}
-
-selkies_url() {
+instance_url() {
     local web_path="$1"
     echo "$(public_base_url)${web_path}"
-}
-
-instance_url() {
-    local backend="$1"
-    local web_path="$2"
-
-    if [ "$backend" = "selkies" ]; then
-        selkies_url "$web_path"
-    else
-        novnc_url "$web_path"
-    fi
 }
 
 tg_is_allowed() {
@@ -345,10 +432,61 @@ instance_dir_by_tg_id() {
     return 1
 }
 
+username_used_by_other() {
+    local username="$1"
+    local owner_tg_id="$2"
+    local env_file env_username env_tg_id
+
+    while IFS= read -r env_file; do
+        env_username="$(env_file_value "$env_file" USERNAME)"
+        env_tg_id="$(env_file_value "$env_file" TG_ID)"
+        if [ "$env_username" = "$username" ] && [ "$env_tg_id" != "$owner_tg_id" ]; then
+            return 0
+        fi
+    done < <(find "$INSTANCES_DIR" -mindepth 2 -maxdepth 2 -name instance.env 2>/dev/null | sort)
+    return 1
+}
+
 delete_audit() {
     local message="$1"
     mkdir -p "$APP_DIR" 2>/dev/null || true
     printf '%s %s\n' "$(date '+%F %T')" "$message" >> "$APP_DIR/delete.log" 2>/dev/null || true
+}
+
+remove_owner_state() {
+    local tg_id="$1"
+    local state_file="$APP_DIR/state/notification-routing.json"
+
+    [ -f "$state_file" ] || return 0
+    python3 - "$state_file" "$tg_id" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+path, tg_id = sys.argv[1:]
+try:
+    with open(path, "r", encoding="utf-8") as source:
+        state = json.load(source)
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(0)
+profiles = state.get("profiles")
+if not isinstance(profiles, dict) or profiles.pop(tg_id, None) is None:
+    raise SystemExit(0)
+directory = os.path.dirname(path)
+fd, temporary = tempfile.mkstemp(prefix=".notification-routing-", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as target:
+        json.dump(state, target, ensure_ascii=False, indent=2, sort_keys=True)
+        target.flush()
+        os.fsync(target.fileno())
+    os.replace(temporary, path)
+finally:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+PY
 }
 
 validate_instance_dir_for_tg_id() {
@@ -360,8 +498,8 @@ validate_instance_dir_for_tg_id() {
     [ -n "$instance_dir" ] || { say_red "INSTANCE_DIR пустой" >&2; return 1; }
     [ -f "$instance_dir/instance.env" ] || { say_red "INSTANCE_ENV_NOT_FOUND" >&2; return 1; }
 
-    base="$(realpath -m "$INSTANCES_DIR")"
-    resolved="$(realpath -m "$instance_dir")"
+    base="$(canonical_path "$INSTANCES_DIR")"
+    resolved="$(canonical_path "$instance_dir")"
     case "$resolved" in
         "$base"/*) ;;
         *)
@@ -406,18 +544,6 @@ generate_web_path() {
     openssl rand -hex 8 | awk '{print "/polmira/"$1"/"}'
 }
 
-write_htpasswd() {
-    local instance_dir="$1"
-    local username="$2"
-    local password="$3"
-    local hash
-
-    hash=$(openssl passwd -apr1 "$password")
-    printf "%s:%s\n" "$username" "$hash" > "$instance_dir/htpasswd"
-    chmod 755 "$APP_DIR" "$INSTANCES_DIR" "$instance_dir"
-    chmod 644 "$instance_dir/htpasswd"
-}
-
 env_file_value() {
     local file="$1"
     local key="$2"
@@ -425,17 +551,92 @@ env_file_value() {
     awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$file"
 }
 
-has_selkies_instances() {
-    local env_file backend
+update_instance_env() {
+    local env_file="$1"
+    shift
+    python3 - "$env_file" "$@" <<'PY'
+import os
+import sys
+import tempfile
 
-    while IFS= read -r env_file; do
-        backend="$(env_file_value "$env_file" BACKEND)"
-        if [ "$backend" = "selkies" ]; then
-            return 0
-        fi
-    done < <(find "$INSTANCES_DIR" -mindepth 2 -maxdepth 2 -name instance.env 2>/dev/null | sort)
+path = sys.argv[1]
+operations = sys.argv[2:]
+updates = {}
+remove = set()
+for operation in operations:
+    if "=" in operation:
+        key, value = operation.split("=", 1)
+        updates[key] = value
+        remove.add(key)
+    else:
+        remove.add(operation)
 
-    return 1
+with open(path, "r", encoding="utf-8") as source:
+    lines = source.read().splitlines()
+kept = [
+    line
+    for line in lines
+    if not any(line.startswith(f"{key}=") for key in remove)
+]
+kept.extend(f"{key}={value}" for key, value in updates.items())
+
+directory = os.path.dirname(path)
+fd, temporary = tempfile.mkstemp(prefix=".instance-", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as target:
+        target.write("\n".join(kept) + "\n")
+        target.flush()
+        os.fsync(target.fileno())
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+finally:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+PY
+}
+
+load_instance_env() {
+    local instance_dir="$1"
+    local env_file="$instance_dir/instance.env"
+    local expected_name expected_container resolved_dir resolved_downloads
+
+    TG_ID="$(env_file_value "$env_file" TG_ID)"
+    INSTANCE_NAME="$(env_file_value "$env_file" INSTANCE_NAME)"
+    CONTAINER_NAME="$(env_file_value "$env_file" CONTAINER_NAME)"
+    WEB_PORT="$(env_file_value "$env_file" WEB_PORT)"
+    WEB_PATH="$(env_file_value "$env_file" WEB_PATH)"
+    USERNAME="$(env_file_value "$env_file" USERNAME)"
+    RELAY_SECRET="$(env_file_value "$env_file" RELAY_SECRET)"
+    DOWNLOADS_DIR="$(env_file_value "$env_file" DOWNLOADS_DIR)"
+
+    validate_tg_id "$TG_ID" || { say_red "BAD_INSTANCE_TG_ID" >&2; return 1; }
+    expected_name="$(safe_name_for_tg "$TG_ID")"
+    expected_container="polmira-max-${TG_ID}"
+    [ "$INSTANCE_NAME" = "$expected_name" ] \
+        || { say_red "BAD_INSTANCE_NAME" >&2; return 1; }
+    [ "$CONTAINER_NAME" = "$expected_container" ] \
+        || { say_red "BAD_CONTAINER_NAME" >&2; return 1; }
+    [[ "$WEB_PORT" =~ ^[0-9]+$ ]] \
+        && [ "$WEB_PORT" -ge "$WEB_RANGE_START" ] \
+        && [ "$WEB_PORT" -le "$WEB_RANGE_END" ] \
+        || { say_red "BAD_WEB_PORT" >&2; return 1; }
+    [[ "$WEB_PATH" =~ ^/polmira/[a-f0-9]{16}/$ ]] \
+        || { say_red "BAD_WEB_PATH" >&2; return 1; }
+    [[ "$USERNAME" =~ ^[A-Za-z0-9_.-]{1,64}$ ]] \
+        || { say_red "BAD_USERNAME" >&2; return 1; }
+    [ -z "$RELAY_SECRET" ] || [[ "$RELAY_SECRET" =~ ^[a-f0-9]{48}$ ]] \
+        || { say_red "BAD_RELAY_SECRET" >&2; return 1; }
+
+    resolved_dir="$(canonical_path "$instance_dir")"
+    if [ -n "$DOWNLOADS_DIR" ]; then
+        resolved_downloads="$(canonical_path "$DOWNLOADS_DIR")"
+        case "$resolved_downloads" in
+            "$resolved_dir"/*) ;;
+            *) say_red "BAD_DOWNLOADS_DIR" >&2; return 1 ;;
+        esac
+    fi
 }
 
 ensure_authelia_image() {
@@ -476,14 +677,11 @@ authelia_hash_password() {
 write_authelia_users() {
     local users_file="$AUTHELIA_DIR/users_database.yml"
     local tmp_file="${users_file}.tmp"
-    local env_file instance_dir backend username password_hash
+    local env_file instance_dir username password_hash
 
     {
         echo "users:"
         while IFS= read -r env_file; do
-            backend="$(env_file_value "$env_file" BACKEND)"
-            [ "$backend" = "selkies" ] || continue
-
             instance_dir="$(dirname "$env_file")"
             username="$(env_file_value "$env_file" USERNAME)"
             [ -n "$username" ] || continue
@@ -509,7 +707,7 @@ EOF
 write_authelia_config() {
     local config_file="$AUTHELIA_DIR/configuration.yml"
     local tmp_file="${config_file}.tmp"
-    local env_file backend web_path username
+    local env_file web_path username
 
     load_config
     require_public_host
@@ -584,9 +782,6 @@ access_control:
 EOF
 
     while IFS= read -r env_file; do
-        backend="$(env_file_value "$env_file" BACKEND)"
-        [ "$backend" = "selkies" ] || continue
-
         web_path="$(env_file_value "$env_file" WEB_PATH)"
         username="$(env_file_value "$env_file" USERNAME)"
         [ -n "$web_path" ] && [ -n "$username" ] || continue
@@ -621,11 +816,7 @@ start_authelia() {
 }
 
 sync_authelia() {
-    if has_selkies_instances; then
-        start_authelia
-    elif container_exists "$AUTHELIA_CONTAINER"; then
-        docker_cmd rm -f "$AUTHELIA_CONTAINER" >/dev/null 2>&1 || true
-    fi
+    start_authelia
 }
 
 prune_orphaned_nginx_configs() {
@@ -765,82 +956,19 @@ server {
 EOF
     fi
 
-    rm -f /etc/nginx/sites-enabled/default \
-        /etc/nginx/sites-enabled/polmira \
-        /etc/nginx/sites-enabled/polmira-linux 2>/dev/null || true
+    rm -f "$NGINX_ROOT/sites-enabled/default" \
+        "$NGINX_ROOT/sites-enabled/polmira" \
+        "$NGINX_ROOT/sites-enabled/polmira-docker" \
+        "$NGINX_ROOT/sites-enabled/polmira-linux" 2>/dev/null || true
     ln -sf "$NGINX_SITE" "$NGINX_SITE_LINK"
     nginx_cmd -t
     systemctl reload nginx
 }
 
-write_legacy_instance_nginx_conf() {
-    local instance_dir="$1"
-    # shellcheck disable=SC1091
-    source "$instance_dir/instance.env"
-
-    cat > "${NGINX_SNIPPETS_DIR}/${INSTANCE_NAME}.conf" <<EOF
-location = ${WEB_PATH}vnc.html {
-    auth_basic "Polmira";
-    auth_basic_user_file ${instance_dir}/htpasswd;
-    add_header Cache-Control "no-store";
-
-    if (\$arg_path = "") {
-        return 302 ${WEB_PATH}vnc.html?autoconnect=1&resize=scale&shared=0&path=${WEB_PATH#/};
-    }
-
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade \$http_upgrade;
-    proxy_set_header Connection \$polmira_docker_connection_upgrade;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto \$scheme;
-    proxy_read_timeout 86400;
-
-    proxy_pass http://127.0.0.1:${WEB_PORT}/vnc.html;
-}
-
-location = ${WEB_PATH}input {
-    auth_basic "Polmira";
-    auth_basic_user_file ${instance_dir}/htpasswd;
-    client_max_body_size 64k;
-
-    proxy_http_version 1.1;
-    proxy_set_header X-Polmira-Tg-Id "${TG_ID}";
-    proxy_set_header X-Polmira-Secret "${RELAY_SECRET}";
-    proxy_set_header Content-Type "text/plain; charset=utf-8";
-    proxy_read_timeout 15s;
-
-    proxy_pass http://172.17.0.1:8788/input;
-}
-
-location ${WEB_PATH} {
-    auth_basic "Polmira";
-    auth_basic_user_file ${instance_dir}/htpasswd;
-    add_header Cache-Control "no-store";
-
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade \$http_upgrade;
-    proxy_set_header Connection \$polmira_docker_connection_upgrade;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto \$scheme;
-    proxy_read_timeout 86400;
-
-    proxy_pass http://127.0.0.1:${WEB_PORT}/;
-}
-EOF
-
-    nginx_cmd -t
-    systemctl reload nginx
-}
-
-write_selkies_instance_nginx_conf() {
+write_instance_nginx_conf() {
     local instance_dir="$1"
     local web_path_without_slash
-    # shellcheck disable=SC1091
-    source "$instance_dir/instance.env"
+    load_instance_env "$instance_dir" || return 1
     web_path_without_slash="${WEB_PATH%/}"
 
     cat > "${NGINX_SNIPPETS_DIR}/${INSTANCE_NAME}.conf" <<EOF
@@ -861,6 +989,34 @@ location = ${WEB_PATH}input {
     proxy_read_timeout 15s;
 
     proxy_pass http://172.17.0.1:8788/input;
+}
+
+location = ${WEB_PATH}push/public-key {
+    auth_request /internal/authelia/authz;
+    auth_request_set \$redirection_url \$upstream_http_location;
+    error_page 401 =302 \$redirection_url;
+
+    proxy_http_version 1.1;
+    proxy_set_header X-Polmira-Tg-Id "${TG_ID}";
+    proxy_set_header X-Polmira-Secret "${RELAY_SECRET}";
+    proxy_read_timeout 15s;
+
+    proxy_pass http://172.17.0.1:8788/push/public-key;
+}
+
+location = ${WEB_PATH}push/subscribe {
+    auth_request /internal/authelia/authz;
+    auth_request_set \$redirection_url \$upstream_http_location;
+    error_page 401 =302 \$redirection_url;
+    client_max_body_size 64k;
+
+    proxy_http_version 1.1;
+    proxy_set_header X-Polmira-Tg-Id "${TG_ID}";
+    proxy_set_header X-Polmira-Secret "${RELAY_SECRET}";
+    proxy_set_header Content-Type \$content_type;
+    proxy_read_timeout 15s;
+
+    proxy_pass http://172.17.0.1:8788/push/subscribe;
 }
 
 location ${WEB_PATH} {
@@ -899,18 +1055,6 @@ EOF
     systemctl reload nginx
 }
 
-write_instance_nginx_conf() {
-    local instance_dir="$1"
-    local backend
-
-    backend="$(env_file_value "$instance_dir/instance.env" BACKEND)"
-    if [ "$backend" = "selkies" ]; then
-        write_selkies_instance_nginx_conf "$instance_dir"
-    else
-        write_legacy_instance_nginx_conf "$instance_dir"
-    fi
-}
-
 remove_instance_nginx_conf() {
     local instance_name="$1"
     rm -f "${NGINX_SNIPPETS_DIR}/${instance_name}.conf"
@@ -930,53 +1074,55 @@ refresh_nginx() {
     done < <(find "$INSTANCES_DIR" -mindepth 2 -maxdepth 2 -name instance.env 2>/dev/null | sort)
 }
 
-ensure_image() {
-    docker_cmd image inspect "$IMAGE" >/dev/null 2>&1 || docker_cmd pull "$IMAGE"
-}
-
-ensure_selkies_image() {
+build_images_from_source() {
+    local force="${1:-no}"
     local build_dir archive_file
-
-    if docker_cmd image inspect "$SELKIES_IMAGE" >/dev/null 2>&1; then
-        return 0
-    fi
-
-    if docker_cmd pull "$SELKIES_IMAGE"; then
-        return 0
-    fi
-
-    if [ "$(uname -m)" != "x86_64" ]; then
-        say_red "MAX для Linux доступен только для amd64/x86_64"
-        return 1
-    fi
 
     build_dir="$(mktemp -d)"
     archive_file="$build_dir/source.tar.gz"
-    say_green "Готового Selkies-образа нет, собираю его локально"
-
-    if ! curl -fsSL "$SELKIES_SOURCE_ARCHIVE" -o "$archive_file"; then
-        rm -rf "$build_dir"
-        say_red "Не удалось скачать исходники Selkies-образа"
-        return 1
-    fi
-
+    say_green "Скачиваю исходники Maxofon для локальной сборки"
+    curl -fsSL "$SOURCE_ARCHIVE" -o "$archive_file"
     mkdir -p "$build_dir/source"
-    if ! tar -xzf "$archive_file" --strip-components=1 -C "$build_dir/source"; then
-        rm -rf "$build_dir"
-        say_red "Не удалось распаковать исходники Selkies-образа"
-        return 1
-    fi
+    tar -xzf "$archive_file" --strip-components=1 -C "$build_dir/source"
 
-    if ! docker_cmd build \
-        -f "$build_dir/source/Dockerfile.selkies" \
-        -t "$SELKIES_IMAGE" \
-        "$build_dir/source"; then
-        rm -rf "$build_dir"
-        say_red "Не удалось собрать Selkies-образ"
-        return 1
+    if [ "$force" = "yes" ] || ! docker_cmd image inspect "$MAX_IMAGE" >/dev/null 2>&1; then
+        docker_cmd build \
+            -f "$build_dir/source/Dockerfile.selkies" \
+            -t "$MAX_IMAGE" \
+            "$build_dir/source"
     fi
-
+    if [ "$force" = "yes" ] || ! docker_cmd image inspect "$BOT_IMAGE" >/dev/null 2>&1; then
+        docker_cmd build \
+            -f "$build_dir/source/Dockerfile.bot" \
+            -t "$BOT_IMAGE" \
+            "$build_dir/source"
+    fi
     rm -rf "$build_dir"
+}
+
+ensure_images() {
+    if ! docker_cmd image inspect "$MAX_IMAGE" >/dev/null 2>&1; then
+        docker_cmd pull "$MAX_IMAGE" || true
+    fi
+    if ! docker_cmd image inspect "$BOT_IMAGE" >/dev/null 2>&1; then
+        docker_cmd pull "$BOT_IMAGE" || true
+    fi
+    if ! docker_cmd image inspect "$MAX_IMAGE" >/dev/null 2>&1 \
+        || ! docker_cmd image inspect "$BOT_IMAGE" >/dev/null 2>&1; then
+        build_images_from_source
+    fi
+    ensure_authelia_image
+}
+
+pull_images() {
+    local pulled_all="yes"
+
+    docker_cmd pull "$MAX_IMAGE" || pulled_all="no"
+    docker_cmd pull "$BOT_IMAGE" || pulled_all="no"
+    docker_cmd pull "$AUTHELIA_IMAGE"
+    if [ "$pulled_all" != "yes" ]; then
+        build_images_from_source yes
+    fi
 }
 
 container_exists() {
@@ -984,20 +1130,58 @@ container_exists() {
     docker_cmd ps -a --format '{{.Names}}' | grep -Fxq "$container"
 }
 
-start_legacy_container() {
-    local instance_dir="$1"
-    local bot_token relay_secret
-    # shellcheck disable=SC1091
-    source "$instance_dir/instance.env"
+start_bot() {
+    ensure_images
+    ensure_relay_secret
 
-    ensure_image
+    docker_cmd rm -f polmira-bot >/dev/null 2>&1 || true
+    docker_cmd run -d \
+        --name polmira-bot \
+        --restart unless-stopped \
+        --privileged \
+        --network host \
+        --pid host \
+        --env-file "$BOT_ENV_FILE" \
+        -e "POLMIRA_BOT_ENV=${BOT_ENV_FILE}" \
+        -e "POLMIRA_CMD=/app/host-polmira" \
+        -e "POLMIRA_APP_DIR=${APP_DIR}" \
+        -e "POLMIRA_USE_SUDO=no" \
+        -v "${APP_DIR}:${APP_DIR}" \
+        -v /var/run/docker.sock:/var/run/docker.sock \
+        -v /etc/nginx:/etc/nginx \
+        "$BOT_IMAGE" >/dev/null
+}
+
+prepare_profile_layout() {
+    local instance_dir="$1"
+    local home="$instance_dir/selkies-home"
+
+    mkdir -p "$home/.config" "$home/.local/share" "$home/Downloads"
+    if [ -d "$instance_dir/max-home" ] && [ ! -e "$home/.config/max" ]; then
+        cp -a "$instance_dir/max-home" "$home/.config/max"
+    fi
+    if [ -d "$instance_dir/oneme-data" ] && [ ! -e "$home/.local/share/ONEME" ]; then
+        cp -a "$instance_dir/oneme-data" "$home/.local/share/ONEME"
+    fi
+    if [ -d "$instance_dir/downloads" ]; then
+        cp -an "$instance_dir/downloads/." "$home/Downloads/" 2>/dev/null || true
+    fi
+    chown -R 1000:1000 "$home"
+}
+
+start_container() {
+    local instance_dir="$1"
+    local bot_token relay_secret render_node
+    local wayland_enabled="false"
+    local -a gpu_args=()
+    local -a gpu_env=()
+    load_instance_env "$instance_dir" || return 1
+
+    ensure_images
     if [ -z "${RELAY_SECRET:-}" ]; then
         RELAY_SECRET="$(openssl rand -hex 24)"
         echo "RELAY_SECRET=$RELAY_SECRET" >> "$instance_dir/instance.env"
     fi
-
-    mkdir -p "$instance_dir/downloads" "$instance_dir/max-home" "$instance_dir/oneme-data" "$instance_dir/logs"
-    chmod 755 "$instance_dir" "$instance_dir/downloads" "$instance_dir/max-home" "$instance_dir/oneme-data" "$instance_dir/logs"
 
     bot_token="$(load_bot_env_value TELEGRAM_BOT_TOKEN || true)"
     relay_secret="$RELAY_SECRET"
@@ -1005,57 +1189,15 @@ start_legacy_container() {
     if container_exists "$CONTAINER_NAME"; then
         docker_cmd rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
     fi
-
-    docker_cmd run -d \
-        --name "$CONTAINER_NAME" \
-        --restart unless-stopped \
-        --cpus "$MAX_CPUS" \
-        --shm-size 1g \
-        -p "127.0.0.1:${WEB_PORT}:6080" \
-        -e "TG_ID=${TG_ID}" \
-        -e "PHONE_NAME=${INSTANCE_NAME}" \
-        -e "TELEGRAM_BOT_TOKEN=${bot_token}" \
-        -e "POLMIRA_RELAY_URL=http://172.17.0.1:8788/notify" \
-        -e "POLMIRA_RELAY_SECRET=${relay_secret}" \
-        -e "RESOLUTION=1280x720x24" \
-        -v "${instance_dir}/downloads:/home/polmira/Downloads" \
-        -v "${instance_dir}/max-home:/home/polmira/.config/max" \
-        -v "${instance_dir}/oneme-data:/home/polmira/.local/share/ONEME" \
-        -v "${instance_dir}/logs:/var/log/polmira" \
-        "$IMAGE" >/dev/null
-}
-
-start_selkies_container() {
-    local instance_dir="$1"
-    local bot_token relay_secret render_node gpu_mode
-    local wayland_enabled="false"
-    local -a gpu_args=()
-    local -a gpu_env=()
-    # shellcheck disable=SC1091
-    source "$instance_dir/instance.env"
-    gpu_mode="${SELKIES_GPU_MODE:-auto}"
-
-    ensure_selkies_image
-    if [ -z "${RELAY_SECRET:-}" ]; then
-        RELAY_SECRET="$(openssl rand -hex 24)"
-        echo "RELAY_SECRET=$RELAY_SECRET" >> "$instance_dir/instance.env"
-    fi
-
-    mkdir -p "$instance_dir/selkies-home" "$instance_dir/selkies-home/Downloads"
-    chown 1000:1000 "$instance_dir/selkies-home" "$instance_dir/selkies-home/Downloads"
+    prepare_profile_layout "$instance_dir"
     chmod 755 "$instance_dir" "$instance_dir/selkies-home" "$instance_dir/selkies-home/Downloads"
 
-    bot_token="$(load_bot_env_value TELEGRAM_BOT_TOKEN || true)"
-    relay_secret="$RELAY_SECRET"
-
-    if [ "$gpu_mode" != "off" ] \
-        && grep -qw avx2 /proc/cpuinfo 2>/dev/null \
+    if grep -qw avx2 /proc/cpuinfo 2>/dev/null \
         && nvidia_selkies_available; then
         gpu_args=(--runtime nvidia --gpus all)
         gpu_env=(-e "AUTO_GPU=true")
         wayland_enabled="true"
-    elif [ "$gpu_mode" != "off" ] \
-        && grep -qw avx2 /proc/cpuinfo 2>/dev/null \
+    elif grep -qw avx2 /proc/cpuinfo 2>/dev/null \
         && [ -d /dev/dri ] \
         && render_node="$(find_dri_render_node)"; then
         gpu_args=(--device /dev/dri:/dev/dri)
@@ -1065,15 +1207,11 @@ start_selkies_container() {
         gpu_args=(--device /dev/dri:/dev/dri)
     fi
 
-    if container_exists "$CONTAINER_NAME"; then
-        docker_cmd rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-    fi
-
     docker_cmd run -d \
         --name "$CONTAINER_NAME" \
         --restart unless-stopped \
         --cpus "$MAX_CPUS" \
-        --memory 2g \
+        --memory "$MAX_MEMORY" \
         --shm-size 1g \
         --security-opt no-new-privileges=true \
         "${gpu_args[@]}" \
@@ -1118,26 +1256,13 @@ start_selkies_container() {
         -e "NO_DECOR=true" \
         -e "RESTART_APP=true" \
         -e "TG_ID=${TG_ID}" \
-        -e "PHONE_NAME=${INSTANCE_NAME}" \
         -e "TELEGRAM_BOT_TOKEN=${bot_token}" \
         -e "POLMIRA_RELAY_URL=http://172.17.0.1:8788/notify" \
         -e "POLMIRA_RELAY_SECRET=${relay_secret}" \
         -e "POLMIRA_USER_HOME=/config" \
         -e "POLMIRA_WATCH_INTERNAL_FILES=no" \
         -v "${instance_dir}/selkies-home:/config" \
-        "$SELKIES_IMAGE" >/dev/null
-}
-
-start_container() {
-    local instance_dir="$1"
-    local backend
-
-    backend="$(env_file_value "$instance_dir/instance.env" BACKEND)"
-    if [ "$backend" = "selkies" ]; then
-        start_selkies_container "$instance_dir"
-    else
-        start_legacy_container "$instance_dir"
-    fi
+        "$MAX_IMAGE" >/dev/null
 }
 
 container_status() {
@@ -1156,28 +1281,18 @@ web_ready() {
 
 instance_info_by_dir() {
     local instance_dir="$1"
-    local status ready backend downloads_dir
-    backend="$(env_file_value "$instance_dir/instance.env" BACKEND)"
-    backend="${backend:-novnc}"
-    # shellcheck disable=SC1091
-    source "$instance_dir/instance.env"
+    local status ready downloads_dir
+    load_instance_env "$instance_dir" || return 1
 
     status="$(container_status "$CONTAINER_NAME")"
     ready="$(web_ready "$WEB_PORT")"
-    if [ "$backend" = "selkies" ]; then
-        downloads_dir="${DOWNLOADS_DIR:-$instance_dir/selkies-home/Downloads}"
-    else
-        downloads_dir="${DOWNLOADS_DIR:-$instance_dir/downloads}"
-    fi
+    downloads_dir="${DOWNLOADS_DIR:-$instance_dir/selkies-home/Downloads}"
 
-    echo "PHONE_NAME=$INSTANCE_NAME"
     echo "INSTANCE_NAME=$INSTANCE_NAME"
-    echo "LINUX_USER=$INSTANCE_NAME"
     echo "CONTAINER_NAME=$CONTAINER_NAME"
     echo "TG_ID=$TG_ID"
     echo "USERNAME=$USERNAME"
-    echo "BACKEND=$backend"
-    echo "URL=$(instance_url "$backend" "$WEB_PATH")"
+    echo "URL=$(instance_url "$WEB_PATH")"
     echo "VPN_ENABLED=no"
     echo "INIT_STATUS=$status"
     echo "WEB_STATUS=$status"
@@ -1219,14 +1334,14 @@ bot_status() {
 
     instance_dir="$(instance_dir_by_tg_id "$tg_id" || true)"
     if [ -z "$instance_dir" ]; then
-        echo "NO_PHONE=1"
+        echo "NO_INSTANCE=1"
         return 0
     fi
 
     instance_info_by_dir "$instance_dir"
 }
 
-bot_create_phone() {
+bot_create_instance() {
     need_root
     create_dirs
     load_config
@@ -1269,7 +1384,6 @@ WEB_PORT=${web_port}
 WEB_PATH=${web_path}
 USERNAME=${username}
 RELAY_SECRET=${relay_secret}
-BACKEND=selkies
 DOWNLOADS_DIR=${instance_dir}/selkies-home/Downloads
 EOF
     printf '%s\n' "$password_hash" > "$instance_dir/authelia-password.hash"
@@ -1283,7 +1397,7 @@ EOF
     instance_info_by_dir "$instance_dir"
 }
 
-bot_start_phone() {
+bot_start_instance() {
     need_root
     create_dirs
     load_config
@@ -1291,28 +1405,25 @@ bot_start_phone() {
 
     local instance_dir
     instance_dir="$(instance_dir_or_fail "${1:-}")" || return 1
-    if [ "$(env_file_value "$instance_dir/instance.env" BACKEND)" = "selkies" ]; then
-        sync_authelia
-    fi
+    sync_authelia
     write_instance_nginx_conf "$instance_dir"
     start_container "$instance_dir"
     sleep 1
     instance_info_by_dir "$instance_dir"
 }
 
-bot_stop_phone() {
+bot_stop_instance() {
     need_root
     create_dirs
 
     local instance_dir
     instance_dir="$(instance_dir_or_fail "${1:-}")" || return 1
-    # shellcheck disable=SC1091
-    source "$instance_dir/instance.env"
+    load_instance_env "$instance_dir" || return 1
     docker_cmd stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
     instance_info_by_dir "$instance_dir"
 }
 
-bot_delete_phone() {
+bot_delete_instance() {
     need_root
     create_dirs
 
@@ -1320,16 +1431,16 @@ bot_delete_phone() {
     tg_id="${1:-}"
     instance_dir="$(instance_dir_or_fail "$tg_id")" || return 1
     validate_instance_dir_for_tg_id "$tg_id" "$instance_dir" || return 1
-    resolved_dir="$(realpath -m "$instance_dir")"
+    resolved_dir="$(canonical_path "$instance_dir")"
 
-    # shellcheck disable=SC1091
-    source "$instance_dir/instance.env"
+    load_instance_env "$instance_dir" || return 1
     instance_name="$INSTANCE_NAME"
 
     delete_audit "start tg_id=$tg_id instance=$instance_name container=$CONTAINER_NAME dir=$resolved_dir"
     docker_cmd rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
     remove_instance_nginx_conf "$instance_name" || true
     rm -rf "$instance_dir"
+    remove_owner_state "$tg_id"
     sync_authelia
     delete_audit "done tg_id=$tg_id instance=$instance_name container=$CONTAINER_NAME dir=$resolved_dir"
     say_green "Контейнер удалён"
@@ -1342,7 +1453,7 @@ bot_set_password() {
     local tg_id="${1:-}"
     local username="${2:-}"
     local password="${3:-}"
-    local instance_dir backend password_hash
+    local instance_dir password_hash
 
     if [ -z "$username" ] || [ -z "$password" ]; then
         say_red "Нужно: bot-set-password TG_ID LOGIN PASSWORD"
@@ -1353,20 +1464,18 @@ bot_set_password() {
         say_red "BAD_USERNAME"
         return 1
     fi
+    if username_used_by_other "$username" "$tg_id"; then
+        say_red "USERNAME_ALREADY_USED"
+        return 1
+    fi
 
     instance_dir="$(instance_dir_or_fail "$tg_id")" || return 1
-    backend="$(env_file_value "$instance_dir/instance.env" BACKEND)"
-    sed -i "/^USERNAME=/d" "$instance_dir/instance.env"
-    echo "USERNAME=$username" >> "$instance_dir/instance.env"
-    if [ "$backend" = "selkies" ]; then
-        password_hash="$(authelia_hash_password "$password")"
-        printf '%s\n' "$password_hash" > "$instance_dir/authelia-password.hash"
-        chmod 600 "$instance_dir/authelia-password.hash"
-        sync_authelia
-        echo "PASSKEY_RESET_REQUIRED=yes"
-    else
-        write_htpasswd "$instance_dir" "$username" "$password"
-    fi
+    update_instance_env "$instance_dir/instance.env" "USERNAME=$username"
+    password_hash="$(authelia_hash_password "$password")"
+    printf '%s\n' "$password_hash" > "$instance_dir/authelia-password.hash"
+    chmod 600 "$instance_dir/authelia-password.hash"
+    sync_authelia
+    echo "PASSKEY_RESET_REQUIRED=yes"
     instance_info_by_dir "$instance_dir"
 }
 
@@ -1376,33 +1485,23 @@ bot_notify_test() {
 
     local instance_dir
     instance_dir="$(instance_dir_or_fail "${1:-}")" || return 1
-    # shellcheck disable=SC1091
-    source "$instance_dir/instance.env"
+    load_instance_env "$instance_dir" || return 1
 
     if [ "$(container_status "$CONTAINER_NAME")" != "running" ]; then
         say_red "CONTAINER_NOT_RUNNING"
         return 1
     fi
 
-    if [ "$(env_file_value "$instance_dir/instance.env" BACKEND)" = "selkies" ]; then
-        docker_cmd exec -u abc "$CONTAINER_NAME" bash -lc '
-            set -e
-            pid="$(pgrep -o -f "/usr/share/max/bin/max")"
-            while IFS= read -r -d "" item; do
-                case "$item" in
-                    DISPLAY=*|DBUS_SESSION_BUS_ADDRESS=*|XDG_RUNTIME_DIR=*) export "$item" ;;
-                esac
-            done < "/proc/${pid}/environ"
-            notify-send "MAX" "Тестовое сообщение Polmira"
-        '
-    else
-        docker_cmd exec -u polmira "$CONTAINER_NAME" bash -lc '
-            set -e
-            [ -f /tmp/polmira-session.env ] && source /tmp/polmira-session.env
-            export DISPLAY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR
-            notify-send "MAX" "Тестовое сообщение Polmira"
-        '
-    fi
+    docker_cmd exec -u abc "$CONTAINER_NAME" bash -lc '
+        set -e
+        pid="$(pgrep -o -f "/usr/share/max/bin/max")"
+        while IFS= read -r -d "" item; do
+            case "$item" in
+                DISPLAY=*|DBUS_SESSION_BUS_ADDRESS=*|XDG_RUNTIME_DIR=*) export "$item" ;;
+            esac
+        done < "/proc/${pid}/environ"
+        notify-send "MAX" "Тестовое сообщение Polmira"
+    '
     say_green "Тестовое уведомление отправлено в DBus"
 }
 
@@ -1410,11 +1509,9 @@ bot_input() {
     need_root
     create_dirs
 
-    local instance_dir input_file input_size backend
+    local instance_dir input_file input_size
     instance_dir="$(instance_dir_or_fail "${1:-}")" || return 1
-    # shellcheck disable=SC1091
-    source "$instance_dir/instance.env"
-    backend="$(env_file_value "$instance_dir/instance.env" BACKEND)"
+    load_instance_env "$instance_dir" || return 1
 
     if [ "$(container_status "$CONTAINER_NAME")" != "running" ]; then
         say_red "CONTAINER_NOT_RUNNING"
@@ -1431,31 +1528,20 @@ bot_input() {
         return 1
     fi
 
-    if [ "$backend" = "selkies" ]; then
-        if ! docker_cmd exec -i -u abc \
-            -e LANG=C.UTF-8 \
-            "$CONTAINER_NAME" bash -lc '
-                set -e
-                pid="$(pgrep -n -f "/usr/share/max/bin/max")"
-                while IFS= read -r -d "" item; do
-                    case "$item" in
-                        DISPLAY=*|XAUTHORITY=*) export "$item" ;;
-                    esac
-                done < "/proc/${pid}/environ"
-                xclip -selection clipboard -in
-                sleep 0.08
-                xdotool key --clearmodifiers ctrl+v
-            ' < "$input_file"; then
-            rm -f "$input_file"
-            say_red "INPUT_FAILED"
-            return 1
-        fi
-    elif ! docker_cmd exec -i -u polmira \
-        -e DISPLAY=:20 \
+    if ! docker_cmd exec -i -u abc \
         -e LANG=C.UTF-8 \
-        "$CONTAINER_NAME" sh -lc \
-        'xclip -selection clipboard -in && sleep 0.08 && xdotool key --clearmodifiers ctrl+v' \
-        < "$input_file"; then
+        "$CONTAINER_NAME" bash -lc '
+            set -e
+            pid="$(pgrep -n -f "/usr/share/max/bin/max")"
+            while IFS= read -r -d "" item; do
+                case "$item" in
+                    DISPLAY=*|XAUTHORITY=*) export "$item" ;;
+                esac
+            done < "/proc/${pid}/environ"
+            xclip -selection clipboard -in
+            sleep 0.08
+            xdotool key --clearmodifiers ctrl+v
+        ' < "$input_file"; then
         rm -f "$input_file"
         say_red "INPUT_FAILED"
         return 1
@@ -1464,25 +1550,116 @@ bot_input() {
     rm -f "$input_file"
 }
 
-bot_install_app() {
-    bot_start_phone "$@"
-}
-
 list_instances() {
     create_dirs
 
-    local env_file instance_dir backend
-    printf "%-18s %-14s %-9s %-10s %-8s %s\n" "TG_ID" "NAME" "BACKEND" "STATUS" "PORT" "URL"
+    local env_file instance_dir
+    printf "%-18s %-14s %-10s %-8s %s\n" "TG_ID" "NAME" "STATUS" "PORT" "URL"
     while IFS= read -r env_file; do
         instance_dir="$(dirname "$env_file")"
-        backend="$(env_file_value "$env_file" BACKEND)"
-        backend="${backend:-novnc}"
-        # shellcheck disable=SC1090
-        source "$env_file"
-        printf "%-18s %-14s %-9s %-10s %-8s %s\n" \
-            "$TG_ID" "$INSTANCE_NAME" "$backend" "$(container_status "$CONTAINER_NAME")" \
-            "$WEB_PORT" "$(instance_url "$backend" "$WEB_PATH")"
+        load_instance_env "$instance_dir" || continue
+        printf "%-18s %-14s %-10s %-8s %s\n" \
+            "$TG_ID" "$INSTANCE_NAME" "$(container_status "$CONTAINER_NAME")" \
+            "$WEB_PORT" "$(instance_url "$WEB_PATH")"
     done < <(find "$INSTANCES_DIR" -mindepth 2 -maxdepth 2 -name instance.env 2>/dev/null | sort)
+}
+
+normalize_instance() {
+    local instance_dir="$1"
+    local username password password_hash
+    local env_file="$instance_dir/instance.env"
+
+    TG_ID="$(env_file_value "$env_file" TG_ID)"
+    validate_tg_id "$TG_ID" || { say_red "BAD_INSTANCE_TG_ID" >&2; return 1; }
+
+    username="$(env_file_value "$env_file" USERNAME)"
+    username="${username:-$(safe_name_for_tg "$TG_ID")}"
+    update_instance_env \
+        "$instance_dir/instance.env" \
+        "USERNAME=${username}" \
+        "DOWNLOADS_DIR=${instance_dir}/selkies-home/Downloads"
+    load_instance_env "$instance_dir" || return 1
+
+    if [ ! -s "$instance_dir/authelia-password.hash" ]; then
+        password="$(openssl rand -hex 8)"
+        password_hash="$(authelia_hash_password "$password")"
+        printf '%s\n' "$password_hash" > "$instance_dir/authelia-password.hash"
+        printf '%s\t%s\t%s\n' "$TG_ID" "$username" "$password"
+    fi
+    chmod 600 "$instance_dir/instance.env" "$instance_dir/authelia-password.hash"
+}
+
+deliver_generated_credentials() {
+    local credentials_file="$1"
+
+    [ -s "$credentials_file" ] || return 0
+    if [ "$(container_status polmira-bot)" != "running" ]; then
+        return 1
+    fi
+
+    docker_cmd exec -i polmira-bot python3 -c '
+import sys
+import main
+
+for raw in sys.stdin:
+    tg_id, username, password = raw.rstrip("\n").split("\t", 2)
+    main.send_message(
+        tg_id,
+        "Maxofon переведён на единую web-версию.\n"
+        f"Новый логин: {username}\n"
+        f"Новый пароль: {password}\n\n"
+        "Открой /start, чтобы получить свою ссылку.",
+    )
+' < "$credentials_file"
+}
+
+recreate_all_instances() {
+    need_root
+    create_dirs
+    load_config
+    ensure_images
+
+    local env_file instance_dir credentials_file generated
+    credentials_file="$APP_DIR/migration-credentials.txt"
+    : > "$credentials_file"
+
+    while IFS= read -r env_file; do
+        instance_dir="$(dirname "$env_file")"
+        generated="$(normalize_instance "$instance_dir")"
+        [ -z "$generated" ] || printf '%s\n' "$generated" >> "$credentials_file"
+    done < <(find "$INSTANCES_DIR" -mindepth 2 -maxdepth 2 -name instance.env 2>/dev/null | sort)
+
+    chmod 600 "$credentials_file"
+    sync_authelia
+    write_nginx_main_config
+
+    while IFS= read -r env_file; do
+        instance_dir="$(dirname "$env_file")"
+        write_instance_nginx_conf "$instance_dir"
+        start_container "$instance_dir"
+    done < <(find "$INSTANCES_DIR" -mindepth 2 -maxdepth 2 -name instance.env 2>/dev/null | sort)
+
+    if [ -s "$credentials_file" ]; then
+        if deliver_generated_credentials "$credentials_file"; then
+            rm -f "$credentials_file"
+            say_green "Новые пароли отправлены владельцам в Telegram"
+        else
+            say_green "Не удалось разослать новые пароли; файл сохранён: $credentials_file"
+        fi
+    else
+        rm -f "$credentials_file"
+    fi
+}
+
+update_polmira() {
+    need_root
+    install_self
+    create_dirs
+    pull_images
+    ensure_nvidia_container_runtime
+    start_bot
+    recreate_all_instances
+    say_green "Maxofon обновлён; все контейнеры работают на одной Selkies-схеме"
 }
 
 prompt_value() {
@@ -1512,10 +1689,11 @@ interactive_menu() {
         echo "5) Сменить логин/пароль"
         echo "6) Тест уведомления"
         echo "7) Показать логи контейнера"
-        echo "8) Установить / обновить nginx"
+        echo "8) Обновить Maxofon и все контейнеры"
         echo "9) Разрешить Telegram ID"
         echo "10) Запретить Telegram ID"
         echo "11) Список разрешённых Telegram ID"
+        echo "12) Повторно настроить домен и бота"
         echo "0) Выход"
         echo
 
@@ -1525,20 +1703,20 @@ interactive_menu() {
         case "$choice" in
             1)
                 tg_id="$(prompt_value "Telegram ID")"
-                bot_create_phone "$tg_id"
+                bot_create_instance "$tg_id"
                 ;;
             2)
                 tg_id="$(prompt_value "Telegram ID")"
-                bot_start_phone "$tg_id"
+                bot_start_instance "$tg_id"
                 ;;
             3)
                 tg_id="$(prompt_value "Telegram ID")"
-                bot_stop_phone "$tg_id"
+                bot_stop_instance "$tg_id"
                 ;;
             4)
                 tg_id="$(prompt_value "Telegram ID")"
                 read -r -p "Точно удалить? Напиши YES: " confirm
-                [ "${confirm:-}" = "YES" ] && bot_delete_phone "$tg_id"
+                [ "${confirm:-}" = "YES" ] && bot_delete_instance "$tg_id"
                 ;;
             5)
                 tg_id="$(prompt_value "Telegram ID")"
@@ -1554,13 +1732,13 @@ interactive_menu() {
                 tg_id="$(prompt_value "Telegram ID")"
                 instance_dir="$(instance_dir_or_fail "$tg_id")" || true
                 if [ -n "${instance_dir:-}" ]; then
-                    # shellcheck disable=SC1090
-                    source "$instance_dir/instance.env"
-                    docker_cmd logs --tail 120 "$CONTAINER_NAME"
+                    if load_instance_env "$instance_dir"; then
+                        docker_cmd logs --tail 120 "$CONTAINER_NAME"
+                    fi
                 fi
                 ;;
             8)
-                install_polmira_docker
+                update_polmira
                 ;;
             9)
                 tg_id="$(prompt_value "Telegram ID")"
@@ -1572,6 +1750,9 @@ interactive_menu() {
                 ;;
             11)
                 list_allowed_ids
+                ;;
+            12)
+                install_polmira
                 ;;
             0)
                 exit 0
@@ -1586,17 +1767,25 @@ interactive_menu() {
     done
 }
 
-install_polmira_docker() {
+install_polmira() {
     need_root
+    install_host_dependencies
+    install_self
     create_dirs
-    ensure_relay_secret
     configure_public_access
+    configure_bot
+    if [ ! -s "$TG_ALLOWED_FILE" ]; then
+        local admin_tg_id
+        admin_tg_id="$(prompt_value "Telegram ID администратора")"
+        [ -z "$admin_tg_id" ] || allow_tg_id "$admin_tg_id"
+    fi
+    pull_images
     write_nginx_main_config
     ensure_nvidia_container_runtime
-    ensure_selkies_image
-    ensure_authelia_image
     sync_authelia
-    say_green "Polmira Docker подготовлена"
+    start_bot
+    recreate_all_instances
+    say_green "Maxofon установлен. Команда управления: polmira"
 }
 
 cli_dispatch() {
@@ -1604,43 +1793,64 @@ cli_dispatch() {
 
     case "$command" in
         bot-status) shift; bot_status "$@" ;;
-        bot-create-phone) shift; bot_create_phone "$@" ;;
-        bot-start-phone) shift; bot_start_phone "$@" ;;
-        bot-stop-phone) shift; bot_stop_phone "$@" ;;
-        bot-delete-phone) shift; bot_delete_phone "$@" ;;
+        bot-create) shift; bot_create_instance "$@" ;;
+        bot-start) shift; bot_start_instance "$@" ;;
+        bot-stop) shift; bot_stop_instance "$@" ;;
+        bot-delete) shift; bot_delete_instance "$@" ;;
         bot-set-password) shift; bot_set_password "$@" ;;
         bot-notify-test) shift; bot_notify_test "$@" ;;
         bot-input) shift; bot_input "$@" ;;
-        bot-install-app) shift; bot_install_app "$@" ;;
+        restart-bot) shift; need_root; create_dirs; start_bot "$@" ;;
         allow) shift; allow_tg_id "$@" ;;
         disallow) shift; disallow_tg_id "$@" ;;
         allowed) shift; list_allowed_ids "$@" ;;
         list) shift; list_instances "$@" ;;
         refresh-nginx) shift; refresh_nginx "$@" ;;
-        menu|"") interactive_menu ;;
-        install) shift; install_polmira_docker "$@" ;;
+        recreate-all) shift; recreate_all_instances "$@" ;;
+        update) shift; update_polmira "$@" ;;
+        menu) shift; interactive_menu ;;
+        "")
+            if [ -f "$CONFIG_FILE" ]; then
+                interactive_menu
+            else
+                install_polmira
+                interactive_menu
+            fi
+            ;;
+        install) shift; install_polmira "$@" ;;
         *) return 1 ;;
     esac
 }
 
-if ! cli_dispatch "$@"; then
+main() {
+    if cli_dispatch "$@"; then
+        return 0
+    fi
+
     cat <<EOF
 Использование:
-  polmira-docker install
-  polmira-docker bot-status TG_ID
-  polmira-docker bot-create-phone TG_ID
-  polmira-docker bot-start-phone TG_ID
-  polmira-docker bot-stop-phone TG_ID
-  polmira-docker bot-delete-phone TG_ID
-  polmira-docker bot-set-password TG_ID LOGIN PASSWORD
-  polmira-docker bot-notify-test TG_ID
-  polmira-docker bot-input TG_ID < UTF8_TEXT_FILE
-  polmira-docker allow TG_ID
-  polmira-docker disallow TG_ID
-  polmira-docker allowed
-  polmira-docker list
-  polmira-docker refresh-nginx
-  polmira-docker menu
+  polmira install
+  polmira update
+  polmira recreate-all
+  polmira bot-status TG_ID
+  polmira bot-create TG_ID
+  polmira bot-start TG_ID
+  polmira bot-stop TG_ID
+  polmira bot-delete TG_ID
+  polmira bot-set-password TG_ID LOGIN PASSWORD
+  polmira bot-notify-test TG_ID
+  polmira bot-input TG_ID < UTF8_TEXT_FILE
+  polmira restart-bot
+  polmira allow TG_ID
+  polmira disallow TG_ID
+  polmira allowed
+  polmira list
+  polmira refresh-nginx
+  polmira menu
 EOF
-    exit 1
+    return 1
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
 fi

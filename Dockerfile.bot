@@ -8,13 +8,18 @@ RUN apt-get update \
 
 WORKDIR /app
 
+RUN pip install --no-cache-dir \
+        "pywebpush==2.3.0" \
+        "requests[socks]>=2.32,<3"
+
 COPY main.py /app/main.py
+COPY polmira.sh /app/polmira.sh
 
 RUN printf '%s\n' \
         '#!/bin/sh' \
-        'exec nsenter -t 1 -m -u -i -n -p /usr/local/bin/polmira-docker "$@"' \
+        'exec nsenter -t 1 -m -u -i -n -p /usr/local/bin/polmira "$@"' \
         > /app/host-polmira \
-    && chmod +x /app/main.py /app/host-polmira
+    && chmod +x /app/main.py /app/polmira.sh /app/host-polmira
 
 ENV POLMIRA_BOT_ENV=/opt/polmira-docker/bot/.env
 ENV POLMIRA_CMD=/app/host-polmira
