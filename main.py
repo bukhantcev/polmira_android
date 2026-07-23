@@ -72,6 +72,7 @@ POLMIRA_RELAY_BIND = os.environ.get("POLMIRA_RELAY_BIND", "172.17.0.1")
 POLMIRA_RELAY_PORT = int(os.environ.get("POLMIRA_RELAY_PORT", "8788"))
 TELEGRAM_API_RETRIES = int(os.environ.get("TELEGRAM_API_RETRIES", "3"))
 TELEGRAM_SEND_TIMEOUT = int(os.environ.get("TELEGRAM_SEND_TIMEOUT", "12"))
+TELEGRAM_CALLBACK_TIMEOUT = int(os.environ.get("TELEGRAM_CALLBACK_TIMEOUT", "3"))
 PENDING_ACTIONS = {}
 INPUT_LOCKS = {}
 INPUT_LOCKS_GUARD = threading.Lock()
@@ -1095,7 +1096,12 @@ def answer_callback(callback_id, text=""):
     if text:
         payload["text"] = text[:180]
 
-    return api("answerCallbackQuery", payload)
+    return api(
+        "answerCallbackQuery",
+        payload,
+        timeout=TELEGRAM_CALLBACK_TIMEOUT,
+        retries=1,
+    )
 
 
 def safe_answer_callback(callback_id, text=""):

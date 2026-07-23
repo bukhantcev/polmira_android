@@ -1235,6 +1235,8 @@ start_container() {
         -e "SELKIES_MANUAL_WIDTH=1280" \
         -e "SELKIES_MANUAL_HEIGHT=720" \
         -e "SELKIES_USE_CSS_SCALING=true" \
+        -e "SELKIES_ENCODER=x264enc" \
+        -e "SELKIES_USE_CPU=false|locked" \
         -e "SELKIES_ENABLE_SHARING=false" \
         -e "SELKIES_ENABLE_COLLAB=false" \
         -e "SELKIES_ENABLE_SHARED=false" \
