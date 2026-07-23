@@ -749,9 +749,9 @@ session:
       authelia_url: "$(public_base_url)/auth"
       default_redirection_url: "$(public_base_url)/"
       same_site: "lax"
-      expiration: "12h"
-      inactivity: "30m"
-      remember_me: "1M"
+      expiration: "10m"
+      inactivity: "10s"
+      remember_me: "0"
 
 storage:
   encryption_key: "${AUTHELIA_STORAGE_ENCRYPTION_KEY}"

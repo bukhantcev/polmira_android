@@ -62,7 +62,7 @@ if index_path.exists():
     html = index_path.read_text(encoding="utf-8")
     if "<title>" not in html:
         html = html.replace("<head>", "<head><title>Maxofon</title>", 1)
-    bridge_tag = '<script src="./polmira-mobile.js?v=20260723-mobile6"></script>'
+    bridge_tag = '<script src="./polmira-mobile.js?v=20260723-mobile7"></script>'
     if bridge_tag not in html:
         html = html.replace(
             '<script type="module"',

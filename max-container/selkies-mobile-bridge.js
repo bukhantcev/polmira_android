@@ -11,6 +11,14 @@
     /Android|iP(?:hone|ad|od)|Mobile/i.test(navigator.userAgent)
     && navigator.maxTouchPoints > 0
   );
+  const isStandaloneApp = (
+    (
+      typeof window.matchMedia === "function"
+      && window.matchMedia("(display-mode: standalone)").matches
+    )
+    || window.navigator.standalone === true
+  );
+  const authRecheckAfterMs = 12000;
   const usesAudioDecoderFallback = (
     /iP(?:hone|ad|od)/.test(navigator.userAgent)
     || typeof window.AudioDecoder !== "function"
@@ -29,6 +37,23 @@
   let mobileTextFlushTimer = null;
   let mobileTextPipeline = Promise.resolve();
   let sessionDisplaced = sessionStorage.getItem(displacedStorageKey) === "1";
+  let hiddenAt = 0;
+
+  if (isMobileTouchClient && isStandaloneApp) {
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") {
+        hiddenAt = Date.now();
+        return;
+      }
+
+      if (hiddenAt && Date.now() - hiddenAt >= authRecheckAfterMs) {
+        const target = new URL(window.location.href);
+        target.searchParams.set("_maxofon_auth", String(Date.now()));
+        window.location.replace(target.toString());
+      }
+      hiddenAt = 0;
+    });
+  }
 
   function installAudioDecoderFallback() {
     if (!usesAudioDecoderFallback) {
