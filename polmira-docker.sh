@@ -1089,7 +1089,7 @@ start_selkies_container() {
         -e "PIXELFLUX_WAYLAND=${wayland_enabled}" \
         -e "NO_GAMEPAD=true" \
         -e "SELKIES_UI_TITLE=Maxofon" \
-        -e "SELKIES_AUDIO_ENABLED=false" \
+        -e "SELKIES_AUDIO_ENABLED=true" \
         -e "SELKIES_MICROPHONE_ENABLED=false" \
         -e "SELKIES_GAMEPAD_ENABLED=false" \
         -e "SELKIES_SECOND_SCREEN=false" \
