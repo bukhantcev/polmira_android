@@ -40,11 +40,16 @@ RUN apt-get -o Acquire::Retries=5 update \
 COPY max-container/notification-daemon.py /usr/local/bin/polmira-notification-daemon
 COPY max-container/file-watcher.py /usr/local/bin/polmira-file-watcher
 COPY max-container/selkies-session.sh /usr/local/bin/polmira-selkies-session
+COPY max-container/patch-selkies-single-session.py /tmp/patch-selkies-single-session.py
 COPY max-container/selkies-pwa-init.sh /custom-cont-init.d/50-polmira-pwa
 COPY max-container/selkies-mobile-bridge.js /usr/share/selkies/www/polmira-mobile.js
+COPY max-container/selkies-opus-worker.js /usr/share/selkies/www/polmira-opus-worker.js
+COPY max-container/opus-decoder.min.js /usr/share/selkies/www/opus-decoder.min.js
 COPY ios/MaxofonClient/Assets.xcassets/AppIcon.appiconset/Icon-1024.png /usr/share/selkies/www/icon.png
 
-RUN printf '%s\n' '/usr/local/bin/polmira-selkies-session' > /defaults/autostart \
+RUN python3 /tmp/patch-selkies-single-session.py \
+    && rm /tmp/patch-selkies-single-session.py \
+    && printf '%s\n' '/usr/local/bin/polmira-selkies-session' > /defaults/autostart \
     && printf '%s\n' '/usr/local/bin/polmira-selkies-session' > /defaults/autostart_wayland \
     && chmod +x \
         /defaults/autostart \
