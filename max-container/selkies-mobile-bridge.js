@@ -4,7 +4,13 @@
   const audioContexts = new Set();
   const audioWorkerBlobs = new WeakSet();
   const audioWorkerUrls = new Set();
+  const boostedAudioOutputs = new WeakMap();
   const nativeSetInterval = window.setInterval.bind(window);
+  const usesAudioDecoderFallback = (
+    /iP(?:hone|ad|od)/.test(navigator.userAgent)
+    || typeof window.AudioDecoder !== "function"
+  );
+  const desktopAudioGain = 4;
   const displacedStorageKey = "maxofon-primary-session-displaced";
   const pageSessionId = (
     crypto.randomUUID?.()
@@ -16,11 +22,7 @@
   let sessionDisplaced = sessionStorage.getItem(displacedStorageKey) === "1";
 
   function installAudioDecoderFallback() {
-    const shouldUseFallback = (
-      /iP(?:hone|ad|od)/.test(navigator.userAgent)
-      || typeof window.AudioDecoder !== "function"
-    );
-    if (!shouldUseFallback) {
+    if (!usesAudioDecoderFallback) {
       return;
     }
 
@@ -66,7 +68,7 @@
       construct(target, args) {
         if (audioWorkerUrls.has(String(args[0]))) {
           const fallbackUrl = new URL(
-            "./polmira-opus-worker.js?v=20260723-mobile2",
+            "./polmira-opus-worker.js?v=20260723-mobile3",
             document.baseURI,
           ).href;
           console.log("Maxofon: using the Safari Opus decoder.");
@@ -234,6 +236,55 @@
   installAudioDecoderFallback();
   installSingleSessionGuard();
 
+  const nativeAudioNodeConnect = window.AudioNode?.prototype?.connect;
+
+  function createBoostedAudioOutput(context) {
+    if (
+      usesAudioDecoderFallback
+      || typeof nativeAudioNodeConnect !== "function"
+      || typeof context.createGain !== "function"
+    ) {
+      return;
+    }
+
+    const gain = context.createGain();
+    gain.gain.value = desktopAudioGain;
+    const limiter = context.createDynamicsCompressor?.();
+
+    if (limiter) {
+      limiter.threshold.value = -3;
+      limiter.knee.value = 0;
+      limiter.ratio.value = 20;
+      limiter.attack.value = 0.003;
+      limiter.release.value = 0.15;
+      nativeAudioNodeConnect.call(gain, limiter);
+      nativeAudioNodeConnect.call(limiter, context.destination);
+    } else {
+      nativeAudioNodeConnect.call(gain, context.destination);
+    }
+
+    boostedAudioOutputs.set(context, {
+      destination: context.destination,
+      input: gain,
+    });
+  }
+
+  if (typeof nativeAudioNodeConnect === "function") {
+    Object.defineProperty(window.AudioNode.prototype, "connect", {
+      configurable: true,
+      value(destination, ...args) {
+        const output = boostedAudioOutputs.get(this.context);
+        const target = (
+          output && destination === output.destination
+            ? output.input
+            : destination
+        );
+        return nativeAudioNodeConnect.call(this, target, ...args);
+      },
+      writable: true,
+    });
+  }
+
   function replaceAudioContext(name, NativeAudioContext) {
     if (typeof NativeAudioContext !== "function" || NativeAudioContext.__polmiraWrapped) {
       return NativeAudioContext;
@@ -243,6 +294,7 @@
       construct(target, args) {
         const context = Reflect.construct(target, args, target);
         audioContexts.add(context);
+        createBoostedAudioOutput(context);
         context.addEventListener?.("statechange", () => {
           if (context.state === "closed") {
             audioContexts.delete(context);

@@ -7,6 +7,7 @@ if (typeof self.Worker !== "function") {
 importScripts("./opus-decoder.min.js?v=0.7.11");
 
 const OpusDecoder = self["opus-decoder"]?.OpusDecoder;
+const OUTPUT_GAIN = 4;
 let decoder = null;
 let workQueue = Promise.resolve();
 
@@ -36,8 +37,11 @@ function interleave(channelData, samplesDecoded) {
   const pcm = new Float32Array(samplesDecoded * 2);
 
   for (let index = 0; index < samplesDecoded; index += 1) {
-    pcm[index * 2] = left[index] || 0;
-    pcm[index * 2 + 1] = right[index] || 0;
+    pcm[index * 2] = Math.max(-1, Math.min(1, (left[index] || 0) * OUTPUT_GAIN));
+    pcm[index * 2 + 1] = Math.max(
+      -1,
+      Math.min(1, (right[index] || 0) * OUTPUT_GAIN),
+    );
   }
   return pcm;
 }
