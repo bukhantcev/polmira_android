@@ -5,6 +5,7 @@
   const audioWorkerBlobs = new WeakSet();
   const audioWorkerUrls = new Set();
   const boostedAudioOutputs = new WeakMap();
+  const textInputBridges = new WeakSet();
   const nativeSetInterval = window.setInterval.bind(window);
   const isMobileTouchClient = (
     /Android|iP(?:hone|ad|od)|Mobile/i.test(navigator.userAgent)
@@ -23,6 +24,10 @@
   let lastInput = null;
   let lastElement = null;
   let gesture = null;
+  let pendingMobileText = "";
+  let pendingMobileTextFallback = null;
+  let mobileTextFlushTimer = null;
+  let mobileTextPipeline = Promise.resolve();
   let sessionDisplaced = sessionStorage.getItem(displacedStorageKey) === "1";
 
   function installAudioDecoderFallback() {
@@ -457,6 +462,137 @@
 
   installLandscapeKeyboardLift();
 
+  function mobileInputEndpoint() {
+    const endpoint = new URL("input", window.location.href);
+    endpoint.search = "";
+    endpoint.hash = "";
+    return endpoint.href;
+  }
+
+  async function postMobileText(text, attempt = 0) {
+    try {
+      const response = await fetch(mobileInputEndpoint(), {
+        method: "POST",
+        credentials: "same-origin",
+        cache: "no-store",
+        redirect: "error",
+        headers: {
+          "Content-Type": "text/plain; charset=utf-8",
+        },
+        body: text,
+      });
+      if (response.status !== 204) {
+        throw new Error(`Text input returned HTTP ${response.status}.`);
+      }
+    } catch (error) {
+      if (attempt >= 4) {
+        throw error;
+      }
+      await new Promise((resolve) => {
+        setTimeout(resolve, Math.min(250 * (attempt + 1), 1000));
+      });
+      await postMobileText(text, attempt + 1);
+    }
+  }
+
+  function flushMobileText() {
+    if (mobileTextFlushTimer !== null) {
+      clearTimeout(mobileTextFlushTimer);
+      mobileTextFlushTimer = null;
+    }
+
+    const text = pendingMobileText;
+    const fallback = pendingMobileTextFallback;
+    pendingMobileText = "";
+    pendingMobileTextFallback = null;
+    if (!text) {
+      return mobileTextPipeline;
+    }
+
+    mobileTextPipeline = mobileTextPipeline.then(async () => {
+      try {
+        await postMobileText(text);
+      } catch (error) {
+        console.error("Maxofon: UTF-8 text input failed.", error);
+        fallback?.(text);
+      }
+    });
+    return mobileTextPipeline;
+  }
+
+  function queueMobileText(text, fallback) {
+    if (!text) {
+      return;
+    }
+
+    pendingMobileText += text;
+    pendingMobileTextFallback = fallback;
+    if (mobileTextFlushTimer !== null) {
+      clearTimeout(mobileTextFlushTimer);
+    }
+
+    const completesFragment = /[\s!?.,;:…]$/u.test(text);
+    mobileTextFlushTimer = setTimeout(
+      flushMobileText,
+      completesFragment ? 0 : 50,
+    );
+  }
+
+  function queueMobileKey(input, keysym) {
+    flushMobileText();
+    mobileTextPipeline = mobileTextPipeline.then(async () => {
+      input?._guac_press?.(keysym);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      input?._guac_release?.(keysym);
+    });
+  }
+
+  function bridgeMobileTextInput(input) {
+    if (
+      !isMobileTouchClient
+      || textInputBridges.has(input)
+      || typeof input._typeString !== "function"
+    ) {
+      return;
+    }
+
+    const nativeTypeString = input._typeString.bind(input);
+    input._typeString = (text) => {
+      queueMobileText(String(text || ""), nativeTypeString);
+    };
+    textInputBridges.add(input);
+    console.log("Maxofon: lossless mobile UTF-8 input enabled.");
+  }
+
+  document.addEventListener("keydown", (event) => {
+    if (
+      !isMobileTouchClient
+      || event.target?.id !== "keyboard-input-assist"
+      || (event.key !== "Enter" && event.key !== "Backspace")
+    ) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopImmediatePropagation();
+
+    if (event.key === "Backspace" && pendingMobileText) {
+      const characters = [...pendingMobileText];
+      characters.pop();
+      pendingMobileText = characters.join("");
+      if (!pendingMobileText && mobileTextFlushTimer !== null) {
+        clearTimeout(mobileTextFlushTimer);
+        mobileTextFlushTimer = null;
+      }
+      return;
+    }
+
+    queueMobileKey(
+      window.webrtcInput,
+      event.key === "Enter" ? 65293 : 65288,
+    );
+  }, true);
+
   function changedTouch(event, identifier) {
     for (const touch of event.changedTouches) {
       if (touch.identifier === identifier) {
@@ -625,6 +761,7 @@
     detachInput();
     lastInput = input;
     lastElement = element;
+    bridgeMobileTextInput(input);
     element.addEventListener("touchstart", onTouchStart, {
       capture: true,
       passive: false,
