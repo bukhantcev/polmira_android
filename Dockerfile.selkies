@@ -41,6 +41,7 @@ COPY max-container/notification-daemon.py /usr/local/bin/polmira-notification-da
 COPY max-container/file-watcher.py /usr/local/bin/polmira-file-watcher
 COPY max-container/selkies-session.sh /usr/local/bin/polmira-selkies-session
 COPY max-container/selkies-pwa-init.sh /custom-cont-init.d/50-polmira-pwa
+COPY max-container/selkies-mobile-bridge.js /usr/share/selkies/www/polmira-mobile.js
 COPY ios/MaxofonClient/Assets.xcassets/AppIcon.appiconset/Icon-1024.png /usr/share/selkies/www/icon.png
 
 RUN printf '%s\n' '/usr/local/bin/polmira-selkies-session' > /defaults/autostart \
