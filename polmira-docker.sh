@@ -10,6 +10,12 @@ NGINX_SITE="/etc/nginx/sites-available/polmira-docker"
 NGINX_SITE_LINK="/etc/nginx/sites-enabled/polmira-docker"
 NGINX_SNIPPETS_DIR="/etc/nginx/polmira-docker"
 IMAGE="${POLMIRA_MAX_IMAGE:-chtotos/polmira_max:latest}"
+SELKIES_IMAGE="${POLMIRA_SELKIES_IMAGE:-chtotos/polmira_max_selkies:2026.07.23}"
+SELKIES_SOURCE_ARCHIVE="${POLMIRA_SELKIES_SOURCE_ARCHIVE:-https://github.com/bukhantcev/polmira_android/archive/refs/heads/master.tar.gz}"
+AUTHELIA_IMAGE="${POLMIRA_AUTHELIA_IMAGE:-authelia/authelia:4.39.20}"
+AUTHELIA_DIR="$APP_DIR/authelia"
+AUTHELIA_CONTAINER="polmira-authelia"
+AUTHELIA_PORT=9091
 MAX_CPUS="${POLMIRA_MAX_CPUS:-0.75}"
 WEB_RANGE_START=6200
 WEB_RANGE_END=6299
@@ -61,7 +67,7 @@ nginx_cmd() {
 }
 
 create_dirs() {
-    mkdir -p "$APP_DIR" "$INSTANCES_DIR" "$NGINX_SNIPPETS_DIR" "$APP_DIR/bot"
+    mkdir -p "$APP_DIR" "$INSTANCES_DIR" "$NGINX_SNIPPETS_DIR" "$APP_DIR/bot" "$AUTHELIA_DIR"
     touch "$TG_ALLOWED_FILE"
 }
 
@@ -170,6 +176,22 @@ public_base_url() {
 novnc_url() {
     local web_path="$1"
     echo "$(public_base_url)${web_path}vnc.html?autoconnect=1&resize=scale&shared=0&path=${web_path#/}"
+}
+
+selkies_url() {
+    local web_path="$1"
+    echo "$(public_base_url)${web_path}"
+}
+
+instance_url() {
+    local backend="$1"
+    local web_path="$2"
+
+    if [ "$backend" = "selkies" ]; then
+        selkies_url "$web_path"
+    else
+        novnc_url "$web_path"
+    fi
 }
 
 tg_is_allowed() {
@@ -327,11 +349,234 @@ write_htpasswd() {
     chmod 644 "$instance_dir/htpasswd"
 }
 
+env_file_value() {
+    local file="$1"
+    local key="$2"
+
+    awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$file"
+}
+
+has_selkies_instances() {
+    local env_file backend
+
+    while IFS= read -r env_file; do
+        backend="$(env_file_value "$env_file" BACKEND)"
+        if [ "$backend" = "selkies" ]; then
+            return 0
+        fi
+    done < <(find "$INSTANCES_DIR" -mindepth 2 -maxdepth 2 -name instance.env 2>/dev/null | sort)
+
+    return 1
+}
+
+ensure_authelia_image() {
+    docker_cmd image inspect "$AUTHELIA_IMAGE" >/dev/null 2>&1 || docker_cmd pull "$AUTHELIA_IMAGE"
+}
+
+ensure_authelia_secrets() {
+    local secrets_file="$AUTHELIA_DIR/secrets.env"
+
+    create_dirs
+    if [ ! -f "$secrets_file" ]; then
+        cat > "$secrets_file" <<EOF
+AUTHELIA_SESSION_SECRET=$(openssl rand -hex 32)
+AUTHELIA_STORAGE_ENCRYPTION_KEY=$(openssl rand -hex 32)
+AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET=$(openssl rand -hex 32)
+EOF
+        chmod 600 "$secrets_file"
+    fi
+}
+
+authelia_hash_password() {
+    local password="$1"
+    local digest
+
+    ensure_authelia_image
+    digest="$(
+        docker_cmd run --rm "$AUTHELIA_IMAGE" \
+            authelia crypto hash generate argon2 --password "$password" \
+            | sed -n 's/^Digest: //p'
+    )"
+    [ -n "$digest" ] || {
+        say_red "AUTHELIA_PASSWORD_HASH_FAILED" >&2
+        return 1
+    }
+    printf '%s\n' "$digest"
+}
+
+write_authelia_users() {
+    local users_file="$AUTHELIA_DIR/users_database.yml"
+    local tmp_file="${users_file}.tmp"
+    local env_file instance_dir backend username password_hash
+
+    {
+        echo "users:"
+        while IFS= read -r env_file; do
+            backend="$(env_file_value "$env_file" BACKEND)"
+            [ "$backend" = "selkies" ] || continue
+
+            instance_dir="$(dirname "$env_file")"
+            username="$(env_file_value "$env_file" USERNAME)"
+            [ -n "$username" ] || continue
+            [ -f "$instance_dir/authelia-password.hash" ] || continue
+            password_hash="$(cat "$instance_dir/authelia-password.hash")"
+
+            cat <<EOF
+  "${username}":
+    disabled: false
+    displayname: "${username}"
+    password: "${password_hash}"
+    email: "${username}@polmira.invalid"
+    groups:
+      - "maxofon"
+EOF
+        done < <(find "$INSTANCES_DIR" -mindepth 2 -maxdepth 2 -name instance.env 2>/dev/null | sort)
+    } > "$tmp_file"
+
+    mv "$tmp_file" "$users_file"
+    chmod 600 "$users_file"
+}
+
+write_authelia_config() {
+    local config_file="$AUTHELIA_DIR/configuration.yml"
+    local tmp_file="${config_file}.tmp"
+    local env_file backend web_path username
+
+    load_config
+    require_public_host
+    ensure_authelia_secrets
+    # shellcheck disable=SC1090
+    source "$AUTHELIA_DIR/secrets.env"
+
+    cat > "$tmp_file" <<EOF
+theme: auto
+
+server:
+  address: "tcp://0.0.0.0:${AUTHELIA_PORT}/auth"
+  endpoints:
+    authz:
+      auth-request:
+        implementation: "AuthRequest"
+
+log:
+  level: info
+
+authentication_backend:
+  password_reset:
+    disable: true
+  file:
+    path: "/config/users_database.yml"
+    watch: true
+    password:
+      algorithm: "argon2"
+
+identity_validation:
+  reset_password:
+    jwt_secret: "${AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET}"
+
+session:
+  name: "polmira_session"
+  secret: "${AUTHELIA_SESSION_SECRET}"
+  cookies:
+    - domain: "${PUBLIC_HOST}"
+      authelia_url: "$(public_base_url)/auth"
+      default_redirection_url: "$(public_base_url)/"
+      same_site: "lax"
+      expiration: "12h"
+      inactivity: "30m"
+      remember_me: "1M"
+
+storage:
+  encryption_key: "${AUTHELIA_STORAGE_ENCRYPTION_KEY}"
+  local:
+    path: "/config/db.sqlite3"
+
+notifier:
+  filesystem:
+    filename: "/config/notification.txt"
+
+webauthn:
+  enable_passkey_login: true
+  experimental_enable_passkey_uv_two_factors: true
+  display_name: "Maxofon"
+  attestation_conveyance_preference: "indirect"
+  selection_criteria:
+    discoverability: "preferred"
+    user_verification: "preferred"
+
+regulation:
+  max_retries: 5
+  find_time: "2m"
+  ban_time: "5m"
+
+access_control:
+  default_policy: "deny"
+  rules:
+EOF
+
+    while IFS= read -r env_file; do
+        backend="$(env_file_value "$env_file" BACKEND)"
+        [ "$backend" = "selkies" ] || continue
+
+        web_path="$(env_file_value "$env_file" WEB_PATH)"
+        username="$(env_file_value "$env_file" USERNAME)"
+        [ -n "$web_path" ] && [ -n "$username" ] || continue
+
+        cat >> "$tmp_file" <<EOF
+    - domain: "${PUBLIC_HOST}"
+      resources:
+        - "^${web_path}.*$"
+      subject:
+        - "user:${username}"
+      policy: "two_factor"
+EOF
+    done < <(find "$INSTANCES_DIR" -mindepth 2 -maxdepth 2 -name instance.env 2>/dev/null | sort)
+
+    mv "$tmp_file" "$config_file"
+    chmod 600 "$config_file"
+}
+
+start_authelia() {
+    ensure_authelia_image
+    write_authelia_users
+    write_authelia_config
+
+    docker_cmd rm -f "$AUTHELIA_CONTAINER" >/dev/null 2>&1 || true
+    docker_cmd run -d \
+        --name "$AUTHELIA_CONTAINER" \
+        --restart unless-stopped \
+        -p "127.0.0.1:${AUTHELIA_PORT}:9091" \
+        -e "TZ=Europe/Moscow" \
+        -v "${AUTHELIA_DIR}:/config" \
+        "$AUTHELIA_IMAGE" >/dev/null
+}
+
+sync_authelia() {
+    if has_selkies_instances; then
+        start_authelia
+    elif container_exists "$AUTHELIA_CONTAINER"; then
+        docker_cmd rm -f "$AUTHELIA_CONTAINER" >/dev/null 2>&1 || true
+    fi
+}
+
+prune_orphaned_nginx_configs() {
+    local config instance_name
+
+    mkdir -p "$NGINX_SNIPPETS_DIR"
+    while IFS= read -r config; do
+        instance_name="$(basename "$config" .conf)"
+        if [ ! -f "$INSTANCES_DIR/$instance_name/instance.env" ]; then
+            rm -f "$config"
+        fi
+    done < <(find "$NGINX_SNIPPETS_DIR" -maxdepth 1 -type f -name '*.conf' 2>/dev/null | sort)
+}
+
 write_nginx_main_config() {
     load_config
     require_public_host
     save_config
     mkdir -p "$NGINX_SNIPPETS_DIR"
+    prune_orphaned_nginx_configs
 
     if [ "$USE_HTTPS" = "yes" ]; then
         cat > "$NGINX_SITE" <<EOF
@@ -356,6 +601,39 @@ server {
 
     client_max_body_size 2G;
 
+    location = /auth {
+        return 302 /auth/;
+    }
+
+    location ^~ /auth/ {
+        proxy_http_version 1.1;
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Original-URL \$scheme://\$http_host\$request_uri;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host \$http_host;
+        proxy_set_header X-Forwarded-Uri \$request_uri;
+        proxy_set_header X-Forwarded-Method \$request_method;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_pass http://127.0.0.1:${AUTHELIA_PORT};
+    }
+
+    location = /internal/authelia/authz {
+        internal;
+        proxy_http_version 1.1;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header X-Original-Method \$request_method;
+        proxy_set_header X-Original-URL \$scheme://\$http_host\$request_uri;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host \$http_host;
+        proxy_set_header X-Forwarded-Uri \$request_uri;
+        proxy_set_header X-Forwarded-Method \$request_method;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_pass http://127.0.0.1:${AUTHELIA_PORT}/auth/api/authz/auth-request;
+    }
+
     location / {
         return 404;
     }
@@ -376,6 +654,39 @@ server {
 
     client_max_body_size 2G;
 
+    location = /auth {
+        return 302 /auth/;
+    }
+
+    location ^~ /auth/ {
+        proxy_http_version 1.1;
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Original-URL \$scheme://\$http_host\$request_uri;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host \$http_host;
+        proxy_set_header X-Forwarded-Uri \$request_uri;
+        proxy_set_header X-Forwarded-Method \$request_method;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_pass http://127.0.0.1:${AUTHELIA_PORT};
+    }
+
+    location = /internal/authelia/authz {
+        internal;
+        proxy_http_version 1.1;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header X-Original-Method \$request_method;
+        proxy_set_header X-Original-URL \$scheme://\$http_host\$request_uri;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host \$http_host;
+        proxy_set_header X-Forwarded-Uri \$request_uri;
+        proxy_set_header X-Forwarded-Method \$request_method;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_pass http://127.0.0.1:${AUTHELIA_PORT}/auth/api/authz/auth-request;
+    }
+
     location / {
         return 404;
     }
@@ -393,7 +704,7 @@ EOF
     systemctl reload nginx
 }
 
-write_instance_nginx_conf() {
+write_legacy_instance_nginx_conf() {
     local instance_dir="$1"
     # shellcheck disable=SC1091
     source "$instance_dir/instance.env"
@@ -456,6 +767,81 @@ EOF
     systemctl reload nginx
 }
 
+write_selkies_instance_nginx_conf() {
+    local instance_dir="$1"
+    local web_path_without_slash
+    # shellcheck disable=SC1091
+    source "$instance_dir/instance.env"
+    web_path_without_slash="${WEB_PATH%/}"
+
+    cat > "${NGINX_SNIPPETS_DIR}/${INSTANCE_NAME}.conf" <<EOF
+location = ${web_path_without_slash} {
+    return 302 ${WEB_PATH};
+}
+
+location = ${WEB_PATH}input {
+    auth_request /internal/authelia/authz;
+    auth_request_set \$redirection_url \$upstream_http_location;
+    error_page 401 =302 \$redirection_url;
+    client_max_body_size 64k;
+
+    proxy_http_version 1.1;
+    proxy_set_header X-Polmira-Tg-Id "${TG_ID}";
+    proxy_set_header X-Polmira-Secret "${RELAY_SECRET}";
+    proxy_set_header Content-Type "text/plain; charset=utf-8";
+    proxy_read_timeout 15s;
+
+    proxy_pass http://172.17.0.1:8788/input;
+}
+
+location ${WEB_PATH} {
+    auth_request /internal/authelia/authz;
+    auth_request_set \$redirection_url \$upstream_http_location;
+    auth_request_set \$user \$upstream_http_remote_user;
+    auth_request_set \$groups \$upstream_http_remote_groups;
+    auth_request_set \$name \$upstream_http_remote_name;
+    auth_request_set \$email \$upstream_http_remote_email;
+    error_page 401 =302 \$redirection_url;
+
+    add_header Cache-Control "no-store";
+    add_header X-Content-Type-Options "nosniff";
+    add_header Referrer-Policy "same-origin";
+
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection \$polmira_docker_connection_upgrade;
+    proxy_set_header Host \$http_host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_set_header Remote-User \$user;
+    proxy_set_header Remote-Groups \$groups;
+    proxy_set_header Remote-Name \$name;
+    proxy_set_header Remote-Email \$email;
+    proxy_read_timeout 86400;
+    proxy_send_timeout 86400;
+    proxy_buffering off;
+
+    proxy_pass http://127.0.0.1:${WEB_PORT};
+}
+EOF
+
+    nginx_cmd -t
+    systemctl reload nginx
+}
+
+write_instance_nginx_conf() {
+    local instance_dir="$1"
+    local backend
+
+    backend="$(env_file_value "$instance_dir/instance.env" BACKEND)"
+    if [ "$backend" = "selkies" ]; then
+        write_selkies_instance_nginx_conf "$instance_dir"
+    else
+        write_legacy_instance_nginx_conf "$instance_dir"
+    fi
+}
+
 remove_instance_nginx_conf() {
     local instance_name="$1"
     rm -f "${NGINX_SNIPPETS_DIR}/${instance_name}.conf"
@@ -467,6 +853,7 @@ refresh_nginx() {
     create_dirs
     load_config
     write_nginx_main_config
+    sync_authelia
 
     local env_file
     while IFS= read -r env_file; do
@@ -478,12 +865,57 @@ ensure_image() {
     docker_cmd image inspect "$IMAGE" >/dev/null 2>&1 || docker_cmd pull "$IMAGE"
 }
 
+ensure_selkies_image() {
+    local build_dir archive_file
+
+    if docker_cmd image inspect "$SELKIES_IMAGE" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if docker_cmd pull "$SELKIES_IMAGE"; then
+        return 0
+    fi
+
+    if [ "$(uname -m)" != "x86_64" ]; then
+        say_red "MAX для Linux доступен только для amd64/x86_64"
+        return 1
+    fi
+
+    build_dir="$(mktemp -d)"
+    archive_file="$build_dir/source.tar.gz"
+    say_green "Готового Selkies-образа нет, собираю его локально"
+
+    if ! curl -fsSL "$SELKIES_SOURCE_ARCHIVE" -o "$archive_file"; then
+        rm -rf "$build_dir"
+        say_red "Не удалось скачать исходники Selkies-образа"
+        return 1
+    fi
+
+    mkdir -p "$build_dir/source"
+    if ! tar -xzf "$archive_file" --strip-components=1 -C "$build_dir/source"; then
+        rm -rf "$build_dir"
+        say_red "Не удалось распаковать исходники Selkies-образа"
+        return 1
+    fi
+
+    if ! docker_cmd build \
+        -f "$build_dir/source/Dockerfile.selkies" \
+        -t "$SELKIES_IMAGE" \
+        "$build_dir/source"; then
+        rm -rf "$build_dir"
+        say_red "Не удалось собрать Selkies-образ"
+        return 1
+    fi
+
+    rm -rf "$build_dir"
+}
+
 container_exists() {
     local container="$1"
     docker_cmd ps -a --format '{{.Names}}' | grep -Fxq "$container"
 }
 
-start_container() {
+start_legacy_container() {
     local instance_dir="$1"
     local bot_token relay_secret
     # shellcheck disable=SC1091
@@ -524,6 +956,103 @@ start_container() {
         "$IMAGE" >/dev/null
 }
 
+start_selkies_container() {
+    local instance_dir="$1"
+    local bot_token relay_secret
+    local -a gpu_args=()
+    # shellcheck disable=SC1091
+    source "$instance_dir/instance.env"
+
+    ensure_selkies_image
+    if [ -z "${RELAY_SECRET:-}" ]; then
+        RELAY_SECRET="$(openssl rand -hex 24)"
+        echo "RELAY_SECRET=$RELAY_SECRET" >> "$instance_dir/instance.env"
+    fi
+
+    mkdir -p "$instance_dir/selkies-home" "$instance_dir/selkies-home/Downloads"
+    chmod 755 "$instance_dir" "$instance_dir/selkies-home" "$instance_dir/selkies-home/Downloads"
+
+    bot_token="$(load_bot_env_value TELEGRAM_BOT_TOKEN || true)"
+    relay_secret="$RELAY_SECRET"
+
+    if [ -d /dev/dri ]; then
+        gpu_args=(--device /dev/dri:/dev/dri)
+    fi
+
+    if container_exists "$CONTAINER_NAME"; then
+        docker_cmd rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    fi
+
+    docker_cmd run -d \
+        --name "$CONTAINER_NAME" \
+        --restart unless-stopped \
+        --cpus "$MAX_CPUS" \
+        --memory 2g \
+        --shm-size 1g \
+        --security-opt no-new-privileges=true \
+        "${gpu_args[@]}" \
+        -p "127.0.0.1:${WEB_PORT}:3000" \
+        -e "PUID=1000" \
+        -e "PGID=1000" \
+        -e "TZ=Europe/Moscow" \
+        -e "LANG=C.UTF-8" \
+        -e "LC_ALL=C.UTF-8" \
+        -e "TITLE=Maxofon" \
+        -e "SUBFOLDER=${WEB_PATH}" \
+        -e "PIXELFLUX_WAYLAND=false" \
+        -e "AUTO_GPU=true" \
+        -e "NO_GAMEPAD=true" \
+        -e "SELKIES_UI_TITLE=Maxofon" \
+        -e "SELKIES_AUDIO_ENABLED=false" \
+        -e "SELKIES_MICROPHONE_ENABLED=false" \
+        -e "SELKIES_GAMEPAD_ENABLED=false" \
+        -e "SELKIES_SECOND_SCREEN=false" \
+        -e "SELKIES_MANUAL_WIDTH=1280" \
+        -e "SELKIES_MANUAL_HEIGHT=720" \
+        -e "SELKIES_USE_CSS_SCALING=true" \
+        -e "SELKIES_ENABLE_SHARING=false" \
+        -e "SELKIES_ENABLE_COLLAB=false" \
+        -e "SELKIES_ENABLE_SHARED=false" \
+        -e "SELKIES_ENABLE_PLAYER2=false" \
+        -e "SELKIES_ENABLE_PLAYER3=false" \
+        -e "SELKIES_ENABLE_PLAYER4=false" \
+        -e "SELKIES_FILE_TRANSFERS=none" \
+        -e "SELKIES_COMMAND_ENABLED=false" \
+        -e "SELKIES_UI_SHOW_LOGO=false" \
+        -e "SELKIES_UI_SHOW_CORE_BUTTONS=false" \
+        -e "SELKIES_UI_SIDEBAR_SHOW_FILES=false" \
+        -e "SELKIES_UI_SIDEBAR_SHOW_APPS=false" \
+        -e "SELKIES_UI_SIDEBAR_SHOW_SHARING=false" \
+        -e "SELKIES_UI_SIDEBAR_SHOW_GAMEPADS=false" \
+        -e "SELKIES_UI_SIDEBAR_SHOW_KEYBOARD_BUTTON=true" \
+        -e "SELKIES_UI_SIDEBAR_SHOW_TRACKPAD=true" \
+        -e "HARDEN_DESKTOP=true" \
+        -e "HARDEN_OPENBOX=true" \
+        -e "NO_DECOR=true" \
+        -e "RESTART_APP=true" \
+        -e "TG_ID=${TG_ID}" \
+        -e "PHONE_NAME=${INSTANCE_NAME}" \
+        -e "TELEGRAM_BOT_TOKEN=${bot_token}" \
+        -e "POLMIRA_RELAY_URL=http://172.17.0.1:8788/notify" \
+        -e "POLMIRA_RELAY_SECRET=${relay_secret}" \
+        -e "POLMIRA_USER_HOME=/config" \
+        -e "POLMIRA_WATCH_INTERNAL_FILES=no" \
+        -v "${instance_dir}/selkies-home:/config" \
+        "$SELKIES_IMAGE" >/dev/null
+}
+
+start_container() {
+    local instance_dir="$1"
+    local backend
+
+    backend="$(env_file_value "$instance_dir/instance.env" BACKEND)"
+    if [ "$backend" = "selkies" ]; then
+        start_selkies_container "$instance_dir"
+    else
+        start_legacy_container "$instance_dir"
+    fi
+}
+
 container_status() {
     local container="$1"
     docker_cmd inspect -f '{{.State.Status}}' "$container" 2>/dev/null || echo "missing"
@@ -540,12 +1069,19 @@ web_ready() {
 
 instance_info_by_dir() {
     local instance_dir="$1"
-    local status ready
+    local status ready backend downloads_dir
+    backend="$(env_file_value "$instance_dir/instance.env" BACKEND)"
+    backend="${backend:-novnc}"
     # shellcheck disable=SC1091
     source "$instance_dir/instance.env"
 
     status="$(container_status "$CONTAINER_NAME")"
     ready="$(web_ready "$WEB_PORT")"
+    if [ "$backend" = "selkies" ]; then
+        downloads_dir="${DOWNLOADS_DIR:-$instance_dir/selkies-home/Downloads}"
+    else
+        downloads_dir="${DOWNLOADS_DIR:-$instance_dir/downloads}"
+    fi
 
     echo "PHONE_NAME=$INSTANCE_NAME"
     echo "INSTANCE_NAME=$INSTANCE_NAME"
@@ -553,13 +1089,14 @@ instance_info_by_dir() {
     echo "CONTAINER_NAME=$CONTAINER_NAME"
     echo "TG_ID=$TG_ID"
     echo "USERNAME=$USERNAME"
-    echo "URL=$(novnc_url "$WEB_PATH")"
+    echo "BACKEND=$backend"
+    echo "URL=$(instance_url "$backend" "$WEB_PATH")"
     echo "VPN_ENABLED=no"
     echo "INIT_STATUS=$status"
     echo "WEB_STATUS=$status"
     echo "WEB_READY=$ready"
     echo "WEB_PORT=$WEB_PORT"
-    echo "DOWNLOADS_DIR=$instance_dir/downloads"
+    echo "DOWNLOADS_DIR=$downloads_dir"
 }
 
 instance_dir_or_fail() {
@@ -609,7 +1146,7 @@ bot_create_phone() {
     write_nginx_main_config
 
     local tg_id="${1:-}"
-    local instance_name instance_dir access_pass web_port web_path container_name username relay_secret
+    local instance_name instance_dir access_pass password_hash web_port web_path container_name username relay_secret
 
     if [ -z "$tg_id" ]; then
         say_red "TG_ID пустой"
@@ -634,8 +1171,9 @@ bot_create_phone() {
     container_name="polmira-max-${tg_id}"
     username="$instance_name"
     relay_secret="$(openssl rand -hex 24)"
+    password_hash="$(authelia_hash_password "$access_pass")"
 
-    mkdir -p "$instance_dir/downloads" "$instance_dir/max-home" "$instance_dir/oneme-data" "$instance_dir/logs"
+    mkdir -p "$instance_dir/selkies-home/Downloads"
     cat > "$instance_dir/instance.env" <<EOF
 TG_ID=${tg_id}
 INSTANCE_NAME=${instance_name}
@@ -644,9 +1182,13 @@ WEB_PORT=${web_port}
 WEB_PATH=${web_path}
 USERNAME=${username}
 RELAY_SECRET=${relay_secret}
+BACKEND=selkies
+DOWNLOADS_DIR=${instance_dir}/selkies-home/Downloads
 EOF
+    printf '%s\n' "$password_hash" > "$instance_dir/authelia-password.hash"
+    chmod 600 "$instance_dir/instance.env" "$instance_dir/authelia-password.hash"
 
-    write_htpasswd "$instance_dir" "$username" "$access_pass"
+    sync_authelia
     write_instance_nginx_conf "$instance_dir"
     start_container "$instance_dir"
 
@@ -662,6 +1204,9 @@ bot_start_phone() {
 
     local instance_dir
     instance_dir="$(instance_dir_or_fail "${1:-}")" || return 1
+    if [ "$(env_file_value "$instance_dir/instance.env" BACKEND)" = "selkies" ]; then
+        sync_authelia
+    fi
     write_instance_nginx_conf "$instance_dir"
     start_container "$instance_dir"
     sleep 1
@@ -698,6 +1243,7 @@ bot_delete_phone() {
     docker_cmd rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
     remove_instance_nginx_conf "$instance_name" || true
     rm -rf "$instance_dir"
+    sync_authelia
     delete_audit "done tg_id=$tg_id instance=$instance_name container=$CONTAINER_NAME dir=$resolved_dir"
     say_green "Контейнер удалён"
 }
@@ -709,7 +1255,7 @@ bot_set_password() {
     local tg_id="${1:-}"
     local username="${2:-}"
     local password="${3:-}"
-    local instance_dir
+    local instance_dir backend password_hash
 
     if [ -z "$username" ] || [ -z "$password" ]; then
         say_red "Нужно: bot-set-password TG_ID LOGIN PASSWORD"
@@ -722,9 +1268,18 @@ bot_set_password() {
     fi
 
     instance_dir="$(instance_dir_or_fail "$tg_id")" || return 1
+    backend="$(env_file_value "$instance_dir/instance.env" BACKEND)"
     sed -i "/^USERNAME=/d" "$instance_dir/instance.env"
     echo "USERNAME=$username" >> "$instance_dir/instance.env"
-    write_htpasswd "$instance_dir" "$username" "$password"
+    if [ "$backend" = "selkies" ]; then
+        password_hash="$(authelia_hash_password "$password")"
+        printf '%s\n' "$password_hash" > "$instance_dir/authelia-password.hash"
+        chmod 600 "$instance_dir/authelia-password.hash"
+        sync_authelia
+        echo "PASSKEY_RESET_REQUIRED=yes"
+    else
+        write_htpasswd "$instance_dir" "$username" "$password"
+    fi
     instance_info_by_dir "$instance_dir"
 }
 
@@ -742,12 +1297,25 @@ bot_notify_test() {
         return 1
     fi
 
-    docker_cmd exec -u polmira "$CONTAINER_NAME" bash -lc '
-        set -e
-        [ -f /tmp/polmira-session.env ] && source /tmp/polmira-session.env
-        export DISPLAY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR
-        notify-send "MAX" "Тестовое сообщение Polmira"
-    '
+    if [ "$(env_file_value "$instance_dir/instance.env" BACKEND)" = "selkies" ]; then
+        docker_cmd exec -u abc "$CONTAINER_NAME" bash -lc '
+            set -e
+            pid="$(pgrep -o -f "/usr/share/max/bin/max")"
+            while IFS= read -r -d "" item; do
+                case "$item" in
+                    DISPLAY=*|DBUS_SESSION_BUS_ADDRESS=*|XDG_RUNTIME_DIR=*) export "$item" ;;
+                esac
+            done < "/proc/${pid}/environ"
+            notify-send "MAX" "Тестовое сообщение Polmira"
+        '
+    else
+        docker_cmd exec -u polmira "$CONTAINER_NAME" bash -lc '
+            set -e
+            [ -f /tmp/polmira-session.env ] && source /tmp/polmira-session.env
+            export DISPLAY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR
+            notify-send "MAX" "Тестовое сообщение Polmira"
+        '
+    fi
     say_green "Тестовое уведомление отправлено в DBus"
 }
 
@@ -755,10 +1323,11 @@ bot_input() {
     need_root
     create_dirs
 
-    local instance_dir input_file input_size
+    local instance_dir input_file input_size backend
     instance_dir="$(instance_dir_or_fail "${1:-}")" || return 1
     # shellcheck disable=SC1091
     source "$instance_dir/instance.env"
+    backend="$(env_file_value "$instance_dir/instance.env" BACKEND)"
 
     if [ "$(container_status "$CONTAINER_NAME")" != "running" ]; then
         say_red "CONTAINER_NOT_RUNNING"
@@ -775,7 +1344,26 @@ bot_input() {
         return 1
     fi
 
-    if ! docker_cmd exec -i -u polmira \
+    if [ "$backend" = "selkies" ]; then
+        if ! docker_cmd exec -i -u abc \
+            -e LANG=C.UTF-8 \
+            "$CONTAINER_NAME" bash -lc '
+                set -e
+                pid="$(pgrep -n -f "/usr/share/max/bin/max")"
+                while IFS= read -r -d "" item; do
+                    case "$item" in
+                        DISPLAY=*|XAUTHORITY=*) export "$item" ;;
+                    esac
+                done < "/proc/${pid}/environ"
+                xclip -selection clipboard -in
+                sleep 0.08
+                xdotool key --clearmodifiers ctrl+v
+            ' < "$input_file"; then
+            rm -f "$input_file"
+            say_red "INPUT_FAILED"
+            return 1
+        fi
+    elif ! docker_cmd exec -i -u polmira \
         -e DISPLAY=:20 \
         -e LANG=C.UTF-8 \
         "$CONTAINER_NAME" sh -lc \
@@ -796,14 +1384,17 @@ bot_install_app() {
 list_instances() {
     create_dirs
 
-    local env_file instance_dir
-    printf "%-18s %-14s %-10s %-8s %s\n" "TG_ID" "NAME" "STATUS" "PORT" "URL"
+    local env_file instance_dir backend
+    printf "%-18s %-14s %-9s %-10s %-8s %s\n" "TG_ID" "NAME" "BACKEND" "STATUS" "PORT" "URL"
     while IFS= read -r env_file; do
         instance_dir="$(dirname "$env_file")"
+        backend="$(env_file_value "$env_file" BACKEND)"
+        backend="${backend:-novnc}"
         # shellcheck disable=SC1090
         source "$env_file"
-        printf "%-18s %-14s %-10s %-8s %s\n" \
-            "$TG_ID" "$INSTANCE_NAME" "$(container_status "$CONTAINER_NAME")" "$WEB_PORT" "$(novnc_url "$WEB_PATH")"
+        printf "%-18s %-14s %-9s %-10s %-8s %s\n" \
+            "$TG_ID" "$INSTANCE_NAME" "$backend" "$(container_status "$CONTAINER_NAME")" \
+            "$WEB_PORT" "$(instance_url "$backend" "$WEB_PATH")"
     done < <(find "$INSTANCES_DIR" -mindepth 2 -maxdepth 2 -name instance.env 2>/dev/null | sort)
 }
 
@@ -914,7 +1505,9 @@ install_polmira_docker() {
     ensure_relay_secret
     configure_public_access
     write_nginx_main_config
-    ensure_image
+    ensure_selkies_image
+    ensure_authelia_image
+    sync_authelia
     say_green "Polmira Docker подготовлена"
 }
 

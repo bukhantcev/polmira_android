@@ -44,6 +44,7 @@ APP_DIR = Path(os.environ.get("POLMIRA_APP_DIR", "/opt/polmira-docker"))
 APPS_DIR = APP_DIR / "apps"
 PHONES_DIR = APP_DIR / "instances"
 BOT_DIR = APP_DIR / "bot"
+AUTHELIA_NOTIFICATION_FILE = APP_DIR / "authelia" / "notification.txt"
 POLL_TIMEOUT = int(os.environ.get("TELEGRAM_POLL_TIMEOUT", "30"))
 TELEGRAM_PROXY = os.environ.get("TELEGRAM_PROXY", "")
 POLMIRA_RELAY_SECRET = os.environ.get("POLMIRA_RELAY_SECRET", "")
@@ -217,6 +218,23 @@ def instance_env_for_tg(tg_id):
     return {}
 
 
+def instance_env_for_username(username):
+    wanted = str(username or "").strip()
+    if not wanted:
+        return {}
+
+    matches = []
+    for env_file in PHONES_DIR.glob("*/instance.env"):
+        data = read_env_file(env_file)
+        if data.get("BACKEND") == "selkies" and data.get("USERNAME") == wanted:
+            matches.append(data)
+
+    if len(matches) != 1:
+        return {}
+
+    return matches[0]
+
+
 def is_valid_relay_secret(tg_id, secret):
     data = instance_env_for_tg(tg_id)
     expected = data.get("RELAY_SECRET", "")
@@ -245,6 +263,9 @@ PHONE_MENU = {
         ],
         [
             {"text": "Сменить логин/пароль", "callback_data": "change_credentials"},
+        ],
+        [
+            {"text": "Face ID / Passkey", "callback_data": "passkey_help"},
         ],
         [
             {"text": "Удалить", "callback_data": "delete_confirm"},
@@ -532,6 +553,74 @@ def start_relay_server():
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     print(f"Polmira relay listening on {POLMIRA_RELAY_BIND}:{POLMIRA_RELAY_PORT}")
+
+
+def parse_authelia_notification(text):
+    start = text.rfind("Date:")
+    if start < 0:
+        return None
+
+    notification = text[start:]
+    recipient_match = re.search(r"^Recipient:\s+\{([^\s}]+)", notification, re.MULTILINE)
+    code_match = re.search(r"^[A-Z0-9]{8}$", notification, re.MULTILINE)
+    if not recipient_match or not code_match:
+        return None
+
+    return recipient_match.group(1), code_match.group(0)
+
+
+def start_authelia_notifier():
+    def file_signature():
+        try:
+            stat = AUTHELIA_NOTIFICATION_FILE.stat()
+            return stat.st_mtime_ns, stat.st_size
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            print(f"Authelia notifier stat failed: {exc}", flush=True)
+            return None
+
+    def worker():
+        last_signature = file_signature()
+
+        while True:
+            time.sleep(1)
+            signature = file_signature()
+            if signature is None or signature == last_signature:
+                continue
+
+            try:
+                text = AUTHELIA_NOTIFICATION_FILE.read_text(encoding="utf-8", errors="ignore")
+            except OSError as exc:
+                print(f"Authelia notifier read failed: {exc}", flush=True)
+                continue
+
+            parsed = parse_authelia_notification(text)
+            if parsed is None:
+                continue
+
+            username, code = parsed
+            instance = instance_env_for_username(username)
+            tg_id = instance.get("TG_ID", "")
+            if not tg_id or not is_allowed_tg(tg_id):
+                print(
+                    f"Authelia notifier refused recipient username={username!r}",
+                    flush=True,
+                )
+                last_signature = signature
+                continue
+
+            last_signature = signature
+            safe_send_message(
+                tg_id,
+                "Maxofon\n"
+                "Код подтверждения Face ID / Passkey:\n"
+                f"{code}\n\n"
+                "Введи его в открытом окне Authelia. Никому не пересылай этот код.",
+            )
+
+    threading.Thread(target=worker, daemon=True).start()
+    print(f"Authelia notifier watching {AUTHELIA_NOTIFICATION_FILE}", flush=True)
 
 
 def answer_callback(callback_id, text=""):
@@ -983,6 +1072,22 @@ def handle_callback(callback):
         send_message(chat_id, "MAX теперь ставится внутри контейнера автоматически. Открой меню заново: /start")
     elif data in {"change_credentials", "change_password"}:
         handle_change_credentials(chat_id, tg_id)
+    elif data == "passkey_help":
+        instance = instance_env_for_tg(tg_id)
+        if instance.get("BACKEND") != "selkies":
+            send_message(
+                chat_id,
+                "Face ID / Passkey доступен для новых Selkies-контейнеров.",
+                PHONE_MENU,
+            )
+        else:
+            send_message(
+                chat_id,
+                "Открой ссылку MAX, войди по логину и паролю, затем выбери "
+                "«Методы» → «Секретный ключ - WebAuthn» → «Регистрация устройства». "
+                "Одноразовый код подтверждения придёт сюда.",
+                PHONE_MENU,
+            )
     elif data.startswith("app:"):
         send_message(chat_id, "Эта команда больше не используется. Открой меню заново: /start")
     elif data == "delete_confirm":
@@ -1028,6 +1133,7 @@ def main():
     offset = 0
     print("Polmira Telegram bot started")
     start_relay_server()
+    start_authelia_notifier()
 
     while True:
         try:

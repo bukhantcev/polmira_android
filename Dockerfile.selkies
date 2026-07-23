@@ -1,0 +1,56 @@
+FROM ghcr.io/linuxserver/baseimage-selkies:ubuntunoble
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get -o Acquire::Retries=5 update \
+    && apt-get install -y --no-install-recommends --fix-missing \
+        ca-certificates \
+        curl \
+        dbus-x11 \
+        fonts-dejavu \
+        fonts-noto-color-emoji \
+        gnome-keyring \
+        gnupg \
+        libasound2t64 \
+        libegl1 \
+        libglib2.0-bin \
+        libnotify-bin \
+        libnss3 \
+        libpulse0 \
+        libxcb-shape0 \
+        python3 \
+        python3-dbus \
+        python3-gi \
+        xclip \
+        xdg-utils \
+        xdotool \
+    && mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://download.max.ru/linux/deb/public.asc \
+        | gpg --dearmor -o /etc/apt/keyrings/max.gpg \
+    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/max.gpg] https://download.max.ru/linux/deb stable main" \
+        > /etc/apt/sources.list.d/max.list \
+    && apt-get -o Acquire::Retries=5 update \
+    && apt-get install -y --no-install-recommends --fix-missing max \
+    && sed -i \
+        "s/'allowed': \\['upload', 'download'\\]/'allowed': ['upload', 'download', 'none']/" \
+        /lsiopy/lib/python3.12/site-packages/selkies/settings.py \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY max-container/notification-daemon.py /usr/local/bin/polmira-notification-daemon
+COPY max-container/file-watcher.py /usr/local/bin/polmira-file-watcher
+COPY max-container/selkies-session.sh /usr/local/bin/polmira-selkies-session
+COPY max-container/selkies-pwa-init.sh /custom-cont-init.d/50-polmira-pwa
+COPY ios/MaxofonClient/Assets.xcassets/AppIcon.appiconset/Icon-1024.png /usr/share/selkies/www/icon.png
+
+RUN printf '%s\n' '/usr/local/bin/polmira-selkies-session' > /defaults/autostart \
+    && printf '%s\n' '/usr/local/bin/polmira-selkies-session' > /defaults/autostart_wayland \
+    && chmod +x \
+        /defaults/autostart \
+        /defaults/autostart_wayland \
+        /custom-cont-init.d/50-polmira-pwa \
+        /usr/local/bin/polmira-notification-daemon \
+        /usr/local/bin/polmira-file-watcher \
+        /usr/local/bin/polmira-selkies-session
+
+EXPOSE 3000

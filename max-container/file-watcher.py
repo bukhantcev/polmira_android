@@ -13,16 +13,24 @@ from pathlib import Path
 TG_ID = os.environ.get("TG_ID", "")
 POLMIRA_RELAY_URL = os.environ.get("POLMIRA_RELAY_URL", "").replace("/notify", "/file")
 POLMIRA_RELAY_SECRET = os.environ.get("POLMIRA_RELAY_SECRET", "")
-STATE_PATH = Path(os.environ.get("POLMIRA_FILE_WATCHER_STATE", "/home/polmira/.cache/polmira-file-watcher.json"))
+USER_HOME = Path(os.environ.get("POLMIRA_USER_HOME", str(Path.home())))
+DOWNLOADS_ROOT = USER_HOME / "Downloads"
+ONEME_ROOT = USER_HOME / ".local/share/ONEME"
+STATE_PATH = Path(
+    os.environ.get(
+        "POLMIRA_FILE_WATCHER_STATE",
+        str(USER_HOME / ".cache/polmira-file-watcher.json"),
+    )
+)
 SCAN_INTERVAL = float(os.environ.get("POLMIRA_FILE_WATCH_INTERVAL", "2"))
 STABLE_SECONDS = float(os.environ.get("POLMIRA_FILE_STABLE_SECONDS", "3"))
 MAX_FILE_BYTES = int(os.environ.get("POLMIRA_FILE_MAX_BYTES", str(49 * 1024 * 1024)))
 FORCE_IPV4 = os.environ.get("TELEGRAM_FORCE_IPV4", "yes").lower() in {"1", "yes", "true", "on"}
 WATCH_INTERNAL_FILES = os.environ.get("POLMIRA_WATCH_INTERNAL_FILES", "no").lower() in {"1", "yes", "true", "on"}
 
-ROOTS = [Path("/home/polmira/Downloads")]
+ROOTS = [DOWNLOADS_ROOT]
 if WATCH_INTERNAL_FILES:
-    ROOTS.append(Path("/home/polmira/.local/share/ONEME"))
+    ROOTS.append(ONEME_ROOT)
 
 EXCLUDED_PARTS = {
     ".crash_dumps",
@@ -88,8 +96,11 @@ def is_watch_candidate(path):
         return False
     if size <= 0 or size > MAX_FILE_BYTES:
         return False
-    if str(path).startswith("/home/polmira/Downloads/"):
+    try:
+        path.relative_to(DOWNLOADS_ROOT)
         return True
+    except ValueError:
+        pass
     path_text = str(path)
     if "/scaledImages/" in path_text and "/original/" not in path_text:
         return False
