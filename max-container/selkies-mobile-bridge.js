@@ -6,6 +6,10 @@
   const audioWorkerUrls = new Set();
   const boostedAudioOutputs = new WeakMap();
   const nativeSetInterval = window.setInterval.bind(window);
+  const isMobileTouchClient = (
+    /Android|iP(?:hone|ad|od)|Mobile/i.test(navigator.userAgent)
+    && navigator.maxTouchPoints > 0
+  );
   const usesAudioDecoderFallback = (
     /iP(?:hone|ad|od)/.test(navigator.userAgent)
     || typeof window.AudioDecoder !== "function"
@@ -334,6 +338,124 @@
       }
     }
   }
+
+  function installLandscapeKeyboardLift() {
+    const viewport = window.visualViewport;
+    if (!isMobileTouchClient || !viewport) {
+      return;
+    }
+
+    const baselineHeights = new Map();
+    let liftedElement = null;
+    let originalTranslate = "";
+    let originalTranslatePriority = "";
+    let currentLift = 0;
+
+    function orientationKey() {
+      return window.innerWidth > window.innerHeight ? "landscape" : "portrait";
+    }
+
+    function textEntryFocused() {
+      const element = document.activeElement;
+      const tagName = element?.tagName?.toLowerCase();
+      return (
+        tagName === "input"
+        || tagName === "textarea"
+        || element?.isContentEditable === true
+      );
+    }
+
+    function restoreLift() {
+      if (liftedElement) {
+        if (originalTranslate) {
+          liftedElement.style.setProperty(
+            "translate",
+            originalTranslate,
+            originalTranslatePriority,
+          );
+        } else {
+          liftedElement.style.removeProperty("translate");
+        }
+        liftedElement.style.removeProperty("will-change");
+      }
+      liftedElement = null;
+      currentLift = 0;
+    }
+
+    function applyLift(lift) {
+      const element = document.getElementById("app");
+      if (!element) {
+        return;
+      }
+
+      if (liftedElement !== element) {
+        restoreLift();
+        liftedElement = element;
+        originalTranslate = element.style.getPropertyValue("translate");
+        originalTranslatePriority = element.style.getPropertyPriority("translate");
+      }
+
+      currentLift = lift;
+      element.style.setProperty("translate", `0 ${-lift}px`, "important");
+      element.style.setProperty("will-change", "translate");
+    }
+
+    function updateKeyboardLift() {
+      const key = orientationKey();
+      const visibleBottom = viewport.height + viewport.offsetTop;
+      let baseline = baselineHeights.get(key);
+      if (!baseline) {
+        baseline = Math.max(window.innerHeight, visibleBottom);
+        baselineHeights.set(key, baseline);
+      }
+
+      const obscuredHeight = Math.max(0, baseline - visibleBottom);
+      if (obscuredHeight < 80) {
+        baselineHeights.set(
+          key,
+          Math.max(baseline, window.innerHeight, visibleBottom),
+        );
+        restoreLift();
+        return;
+      }
+
+      if (
+        key !== "landscape"
+        || (!textEntryFocused() && currentLift === 0)
+      ) {
+        restoreLift();
+        return;
+      }
+
+      applyLift(
+        Math.round(Math.min(obscuredHeight, baseline * 0.7)),
+      );
+    }
+
+    for (const eventName of ["resize", "scroll"]) {
+      viewport.addEventListener(eventName, updateKeyboardLift);
+    }
+    window.addEventListener("resize", updateKeyboardLift);
+    window.addEventListener("orientationchange", () => {
+      restoreLift();
+      baselineHeights.clear();
+      setTimeout(updateKeyboardLift, 250);
+    });
+    document.addEventListener("focusin", () => {
+      setTimeout(updateKeyboardLift, 50);
+    });
+    document.addEventListener("focusout", () => {
+      setTimeout(updateKeyboardLift, 50);
+    });
+    window.addEventListener("pagehide", restoreLift, { once: true });
+
+    baselineHeights.set(
+      orientationKey(),
+      Math.max(window.innerHeight, viewport.height + viewport.offsetTop),
+    );
+  }
+
+  installLandscapeKeyboardLift();
 
   function changedTouch(event, identifier) {
     for (const touch of event.changedTouches) {
