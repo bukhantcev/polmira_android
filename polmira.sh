@@ -1496,7 +1496,7 @@ bot_notify_test() {
 
     docker_cmd exec -u abc "$CONTAINER_NAME" bash -lc '
         set -e
-        pid="$(pgrep -o -f "/usr/share/max/bin/max")"
+        pid="$(pgrep -o -f "^/usr/share/max/bin/max( |$)")"
         while IFS= read -r -d "" item; do
             case "$item" in
                 DISPLAY=*|DBUS_SESSION_BUS_ADDRESS=*|XDG_RUNTIME_DIR=*) export "$item" ;;
@@ -1534,7 +1534,7 @@ bot_input() {
         -e LANG=C.UTF-8 \
         "$CONTAINER_NAME" bash -lc '
             set -e
-            pid="$(pgrep -n -f "/usr/share/max/bin/max")"
+            pid="$(pgrep -o -f "^/usr/share/max/bin/max( |$)")"
             while IFS= read -r -d "" item; do
                 case "$item" in
                     DISPLAY=*|XAUTHORITY=*) export "$item" ;;
@@ -1542,6 +1542,8 @@ bot_input() {
             done < "/proc/${pid}/environ"
             xclip -selection clipboard -in
             sleep 0.08
+            xdotool keyup Shift_L Shift_R Control_L Control_R \
+                Alt_L Alt_R Super_L Super_R 2>/dev/null || true
             xdotool key --clearmodifiers ctrl+v
         ' < "$input_file"; then
         rm -f "$input_file"

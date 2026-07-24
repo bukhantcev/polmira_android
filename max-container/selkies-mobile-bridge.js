@@ -6,6 +6,26 @@
   const audioWorkerUrls = new Set();
   const boostedAudioOutputs = new WeakMap();
   const textInputBridges = new WeakSet();
+  const mobileAssistModifierKeys = new Set([
+    "Alt",
+    "AltGraph",
+    "CapsLock",
+    "Control",
+    "Meta",
+    "Shift",
+  ]);
+  const remoteModifierKeysyms = [
+    65027, // ISO_Level3_Shift / AltGraph
+    65505, // Shift_L
+    65506, // Shift_R
+    65507, // Control_L
+    65508, // Control_R
+    65509, // Caps_Lock
+    65513, // Alt_L
+    65514, // Alt_R
+    65515, // Super_L
+    65516, // Super_R
+  ];
   const nativeSetInterval = window.setInterval.bind(window);
   const isMobileTouchClient = (
     /Android|iP(?:hone|ad|od)|Mobile/i.test(navigator.userAgent)
@@ -732,6 +752,38 @@
     textInputBridges.add(input);
     console.log("Maxofon: lossless mobile UTF-8 input enabled.");
   }
+
+  function releaseRemoteModifiers(input = window.webrtcInput) {
+    for (const keysym of remoteModifierKeysyms) {
+      input?._guac_release?.(keysym);
+    }
+  }
+
+  function stopMobileAssistModifier(event) {
+    if (
+      !isMobileTouchClient
+      || event.target?.id !== "keyboard-input-assist"
+      || !mobileAssistModifierKeys.has(event.key)
+    ) {
+      return;
+    }
+
+    // Keep the browser default so iOS can compose uppercase and symbols, but
+    // do not let Selkies forward the modifier into the remote X11 session.
+    event.stopImmediatePropagation();
+  }
+
+  document.addEventListener("keydown", stopMobileAssistModifier, true);
+  document.addEventListener("keyup", stopMobileAssistModifier, true);
+
+  document.addEventListener("focusin", (event) => {
+    if (
+      isMobileTouchClient
+      && event.target?.id === "keyboard-input-assist"
+    ) {
+      releaseRemoteModifiers();
+    }
+  }, true);
 
   document.addEventListener("keydown", (event) => {
     if (
