@@ -42,7 +42,7 @@ if manifest_path.exists():
             "start_url": subfolder,
             "name": "Maxofon",
             "short_name": "Maxofon",
-            "orientation": "landscape",
+            "orientation": "any",
             "display": "fullscreen",
             "icons": [
                 {
@@ -63,7 +63,7 @@ if index_path.exists():
     html = index_path.read_text(encoding="utf-8")
     if "<title>" not in html:
         html = html.replace("<head>", "<head><title>Maxofon</title>", 1)
-    bridge_tag = '<script src="./polmira-mobile.js?v=20260724-mobile8"></script>'
+    bridge_tag = '<script src="./polmira-mobile.js?v=20260724-mobile24"></script>'
     bridge_pattern = r'<script src="\./polmira-mobile\.js\?v=[^"]+"></script>'
     if re.search(bridge_pattern, html):
         html = re.sub(bridge_pattern, bridge_tag, html, count=1)

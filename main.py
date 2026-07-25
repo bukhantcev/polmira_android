@@ -769,6 +769,10 @@ class RelayHandler(BaseHTTPRequestHandler):
             self.handle_push_public_key()
             return
 
+        if self.path == "/media-state":
+            self.handle_media_state()
+            return
+
         self.send_response(404)
         self.end_headers()
 
@@ -833,6 +837,24 @@ class RelayHandler(BaseHTTPRequestHandler):
             self.send_json(200, {"publicKey": ensure_vapid_keys()})
         except Exception as exc:
             print(f"Push public key error: {exc}", flush=True)
+            self.send_response(500)
+            self.end_headers()
+
+    def handle_media_state(self):
+        try:
+            tg_id = self.relay_identity()
+            if not tg_id:
+                self.send_response(403)
+                self.end_headers()
+                return
+
+            output = run_polmira("bot-media-state", tg_id)
+            self.send_json(
+                200,
+                {"active": "MEDIA_ACTIVE=yes" in output.splitlines()},
+            )
+        except Exception as exc:
+            print(f"Media state error: {exc}", flush=True)
             self.send_response(500)
             self.end_headers()
 

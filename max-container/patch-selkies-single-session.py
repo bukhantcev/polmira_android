@@ -23,6 +23,55 @@ def replace_once(source: str, old: str, new: str) -> str:
 
 source = SELKIES_PATH.read_text(encoding="utf-8")
 
+if 'message.startswith("MAXOFON_UTF8,")' in source:
+    if 'message.startswith("MAXOFON_KEY,")' not in source:
+        source = replace_once(
+            source,
+            """                    elif message.startswith("MAXOFON_UTF8,"):
+""",
+            """                    elif message.startswith("MAXOFON_KEY,"):
+                        perms = client_permissions.get(websocket)
+                        role = perms.get("role") if perms else "viewer"
+                        display_state = self.display_clients.get("primary")
+                        if (
+                            client_display_id != "primary"
+                            or role != "controller"
+                            or not display_state
+                            or display_state.get("ws") is not websocket
+                        ):
+                            data_logger.warning(
+                                "Blocked key input from a non-primary controller."
+                            )
+                            continue
+
+                        try:
+                            keysym = int(message.split(",", 1)[1])
+                            if keysym not in (65288, 65293, 65307):
+                                raise ValueError("key input is not allowed")
+                            if not self.input_handler:
+                                raise RuntimeError("input handler is unavailable")
+
+                            await self.input_handler.on_message(
+                                f"kd,{keysym}",
+                                client_display_id,
+                            )
+                            await asyncio.sleep(0.015)
+                            await self.input_handler.on_message(
+                                f"ku,{keysym}",
+                                client_display_id,
+                            )
+                        except Exception as input_error:
+                            data_logger.error(
+                                f"Failed to inject Maxofon key input: "
+                                f"{input_error}"
+                            )
+
+                    elif message.startswith("MAXOFON_UTF8,"):
+""",
+        )
+        SELKIES_PATH.write_text(source, encoding="utf-8")
+    raise SystemExit(0)
+
 source = replace_once(
     source,
     """    async def ws_handler(self, websocket):
@@ -136,6 +185,131 @@ source = replace_once(
                                 display_state['ws'] = websocket
                                 display_state['maxofon_client_id'] = maxofon_client_id
                                 display_state['video_active'] = True
+""",
+)
+
+source = replace_once(
+    source,
+    """    if data_server_instance:
+        server_is_manual, _ = data_server_instance.cli_args.is_manual_resolution_mode
+        if server_is_manual:
+            logger_gst_app_resize.warning(
+                f"Client attempted to resize to {res_str} but server is in manual resolution mode. Request ignored."
+            )
+            return
+""",
+    """    if data_server_instance:
+        server_is_manual, _ = data_server_instance.cli_args.is_manual_resolution_mode
+        if server_is_manual:
+            logger_gst_app_resize.info(
+                f"Maxofon client resize overrides the configured startup resolution: {res_str}."
+            )
+""",
+)
+
+source = replace_once(
+    source,
+    """            new_dpi = sanitize_value("scaling_dpi", settings.get("scaling_dpi"))
+""",
+    """            # Keep the Linux desktop at one logical pixel per output pixel.
+            # Mobile Safari reports its device-pixel-ratio as DPI, which otherwise
+            # makes Wayland expose a tiny logical desktop (for example 426x573).
+            new_dpi = 96
+""",
+)
+
+source = replace_once(
+    source,
+    """                    elif message.startswith("cmd,"):
+""",
+    """                    elif message.startswith("MAXOFON_KEY,"):
+                        perms = client_permissions.get(websocket)
+                        role = perms.get("role") if perms else "viewer"
+                        display_state = self.display_clients.get("primary")
+                        if (
+                            client_display_id != "primary"
+                            or role != "controller"
+                            or not display_state
+                            or display_state.get("ws") is not websocket
+                        ):
+                            data_logger.warning(
+                                "Blocked key input from a non-primary controller."
+                            )
+                            continue
+
+                        try:
+                            keysym = int(message.split(",", 1)[1])
+                            if keysym not in (65288, 65293, 65307):
+                                raise ValueError("key input is not allowed")
+                            if not self.input_handler:
+                                raise RuntimeError("input handler is unavailable")
+
+                            await self.input_handler.on_message(
+                                f"kd,{keysym}",
+                                client_display_id,
+                            )
+                            await asyncio.sleep(0.015)
+                            await self.input_handler.on_message(
+                                f"ku,{keysym}",
+                                client_display_id,
+                            )
+                        except Exception as input_error:
+                            data_logger.error(
+                                f"Failed to inject Maxofon key input: "
+                                f"{input_error}"
+                            )
+
+                    elif message.startswith("MAXOFON_UTF8,"):
+                        perms = client_permissions.get(websocket)
+                        role = perms.get("role") if perms else "viewer"
+                        display_state = self.display_clients.get("primary")
+                        if (
+                            client_display_id != "primary"
+                            or role != "controller"
+                            or not display_state
+                            or display_state.get("ws") is not websocket
+                        ):
+                            data_logger.warning(
+                                "Blocked UTF-8 input from a non-primary controller."
+                            )
+                            continue
+
+                        try:
+                            encoded_text = message.split(",", 1)[1]
+                            if len(encoded_text) > 8192:
+                                raise ValueError("encoded input is too large")
+                            text_bytes = base64.b64decode(
+                                encoded_text,
+                                validate=True,
+                            )
+                            if not text_bytes or len(text_bytes) > 4096:
+                                raise ValueError("decoded input has invalid size")
+                            text = text_bytes.decode("utf-8")
+                            if "\\x00" in text:
+                                raise ValueError("decoded input contains NUL")
+
+                            if not self.input_handler:
+                                raise RuntimeError("input handler is unavailable")
+                            if not await self.input_handler.write_clipboard(text):
+                                raise RuntimeError("clipboard write failed")
+
+                            for key_message in (
+                                "kd,65507",
+                                "kd,118",
+                                "ku,118",
+                                "ku,65507",
+                            ):
+                                await self.input_handler.on_message(
+                                    key_message,
+                                    client_display_id,
+                                )
+                        except Exception as input_error:
+                            data_logger.error(
+                                f"Failed to inject Maxofon UTF-8 input: "
+                                f"{input_error}"
+                            )
+
+                    elif message.startswith("cmd,"):
 """,
 )
 

@@ -10,8 +10,8 @@ NGINX_ROOT="${POLMIRA_NGINX_ROOT:-/etc/nginx}"
 NGINX_SITE="$NGINX_ROOT/sites-available/polmira"
 NGINX_SITE_LINK="$NGINX_ROOT/sites-enabled/polmira"
 NGINX_SNIPPETS_DIR="$NGINX_ROOT/polmira"
-MAX_IMAGE="${POLMIRA_MAX_IMAGE:-chtotos/polmira_max_selkies:2026.07.23-unified1}"
-BOT_IMAGE="${POLMIRA_BOT_IMAGE:-chtotos/polmira_bot:2026.07.23-unified1}"
+MAX_IMAGE="${POLMIRA_MAX_IMAGE:-chtotos/polmira_max_selkies:2026.07.24-unified8}"
+BOT_IMAGE="${POLMIRA_BOT_IMAGE:-chtotos/polmira_bot:2026.07.24-unified2}"
 SOURCE_ARCHIVE="${POLMIRA_SOURCE_ARCHIVE:-https://github.com/bukhantcev/polmira_android/archive/refs/heads/master.tar.gz}"
 AUTHELIA_IMAGE="${POLMIRA_AUTHELIA_IMAGE:-authelia/authelia:4.39.20}"
 AUTHELIA_DIR="$APP_DIR/authelia"
@@ -991,6 +991,19 @@ location = ${WEB_PATH}input {
     proxy_pass http://172.17.0.1:8788/input;
 }
 
+location = ${WEB_PATH}media-state {
+    auth_request /internal/authelia/authz;
+    auth_request_set \$redirection_url \$upstream_http_location;
+    error_page 401 =302 \$redirection_url;
+
+    proxy_http_version 1.1;
+    proxy_set_header X-Polmira-Tg-Id "${TG_ID}";
+    proxy_set_header X-Polmira-Secret "${RELAY_SECRET}";
+    proxy_read_timeout 5s;
+
+    proxy_pass http://172.17.0.1:8788/media-state;
+}
+
 location = ${WEB_PATH}push/public-key {
     auth_request /internal/authelia/authz;
     auth_request_set \$redirection_url \$upstream_http_location;
@@ -1234,6 +1247,7 @@ start_container() {
         -e "SELKIES_SECOND_SCREEN=false" \
         -e "SELKIES_MANUAL_WIDTH=1280" \
         -e "SELKIES_MANUAL_HEIGHT=720" \
+        -e "SELKIES_SCALING_DPI=96" \
         -e "SELKIES_USE_CSS_SCALING=true" \
         -e "SELKIES_ENCODER=x264enc" \
         -e "SELKIES_USE_CPU=false|locked" \
@@ -1554,6 +1568,24 @@ bot_input() {
     rm -f "$input_file"
 }
 
+bot_media_state() {
+    need_root
+    create_dirs
+
+    local instance_dir now state_file state state_mtime
+    instance_dir="$(instance_dir_or_fail "${1:-}")" || return 1
+    state_file="$instance_dir/selkies-home/.cache/polmira/media-state"
+    state="$(head -n 1 "$state_file" 2>/dev/null || true)"
+    state_mtime="$(stat -c %Y "$state_file" 2>/dev/null || echo 0)"
+    now="$(date +%s)"
+
+    if [ "$state" = "yes" ] && [ $((now - state_mtime)) -le 4 ]; then
+        echo "MEDIA_ACTIVE=yes"
+    else
+        echo "MEDIA_ACTIVE=no"
+    fi
+}
+
 list_instances() {
     create_dirs
 
@@ -1804,6 +1836,7 @@ cli_dispatch() {
         bot-set-password) shift; bot_set_password "$@" ;;
         bot-notify-test) shift; bot_notify_test "$@" ;;
         bot-input) shift; bot_input "$@" ;;
+        bot-media-state) shift; bot_media_state "$@" ;;
         restart-bot) shift; need_root; create_dirs; start_bot "$@" ;;
         allow) shift; allow_tg_id "$@" ;;
         disallow) shift; disallow_tg_id "$@" ;;
@@ -1844,6 +1877,7 @@ main() {
   polmira bot-set-password TG_ID LOGIN PASSWORD
   polmira bot-notify-test TG_ID
   polmira bot-input TG_ID < UTF8_TEXT_FILE
+  polmira bot-media-state TG_ID
   polmira restart-bot
   polmira allow TG_ID
   polmira disallow TG_ID
