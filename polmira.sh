@@ -6,14 +6,17 @@ INSTANCES_DIR="$APP_DIR/instances"
 CONFIG_FILE="$APP_DIR/config.env"
 TG_ALLOWED_FILE="$APP_DIR/tg-allowed.txt"
 BOT_ENV_FILE="$APP_DIR/bot/.env"
+EGRESS_DIR="$APP_DIR/egress"
+EGRESS_ENV_FILE="$EGRESS_DIR/proxy.env"
 NGINX_ROOT="${POLMIRA_NGINX_ROOT:-/etc/nginx}"
 NGINX_SITE="$NGINX_ROOT/sites-available/polmira"
 NGINX_SITE_LINK="$NGINX_ROOT/sites-enabled/polmira"
 NGINX_SNIPPETS_DIR="$NGINX_ROOT/polmira"
-MAX_IMAGE="${POLMIRA_MAX_IMAGE:-chtotos/polmira_max_selkies:2026.07.24-unified8}"
+MAX_IMAGE="${POLMIRA_MAX_IMAGE:-chtotos/polmira_max_selkies:2026.07.29-unified10}"
 BOT_IMAGE="${POLMIRA_BOT_IMAGE:-chtotos/polmira_bot:2026.07.24-unified2}"
 SOURCE_ARCHIVE="${POLMIRA_SOURCE_ARCHIVE:-https://github.com/bukhantcev/polmira_android/archive/refs/heads/master.tar.gz}"
 AUTHELIA_IMAGE="${POLMIRA_AUTHELIA_IMAGE:-authelia/authelia:4.39.20}"
+SING_BOX_IMAGE="${POLMIRA_SING_BOX_IMAGE:-ghcr.io/sagernet/sing-box@sha256:4aa30343cea6b5407960f99b36ffa653403d9ddcb1fc2800c9fb85a1bd77d6d8}"
 AUTHELIA_DIR="$APP_DIR/authelia"
 AUTHELIA_CONTAINER="polmira-authelia"
 AUTHELIA_PORT=9091
@@ -76,7 +79,8 @@ install_host_dependencies() {
         curl \
         nginx \
         openssl \
-        python3
+        python3 \
+        util-linux
     if ! exists docker; then
         apt-get install -y --no-install-recommends docker.io
     fi
@@ -181,11 +185,12 @@ create_dirs() {
         "$APP_DIR" \
         "$APP_DIR/bot" \
         "$APP_DIR/state" \
+        "$EGRESS_DIR" \
         "$INSTANCES_DIR" \
         "$NGINX_SNIPPETS_DIR" \
         "$AUTHELIA_DIR"
     touch "$TG_ALLOWED_FILE"
-    chmod 700 "$APP_DIR/state"
+    chmod 700 "$APP_DIR/state" "$EGRESS_DIR"
 }
 
 load_config() {
@@ -334,6 +339,303 @@ ensure_relay_secret() {
         echo "POLMIRA_RELAY_PORT=8788"
     } >> "$BOT_ENV_FILE"
     chmod 600 "$BOT_ENV_FILE" || true
+}
+
+egress_env_value() {
+    local key="$1"
+
+    if [ -f "$EGRESS_ENV_FILE" ]; then
+        awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' \
+            "$EGRESS_ENV_FILE"
+    fi
+}
+
+load_egress_config() {
+    EGRESS_MODE="$(egress_env_value EGRESS_MODE || true)"
+    EGRESS_MODE="${EGRESS_MODE:-direct}"
+    EGRESS_SERVER="$(egress_env_value EGRESS_SERVER || true)"
+    EGRESS_PORT="$(egress_env_value EGRESS_PORT || true)"
+    EGRESS_UUID="$(egress_env_value EGRESS_UUID || true)"
+    EGRESS_SERVER_NAME="$(egress_env_value EGRESS_SERVER_NAME || true)"
+    EGRESS_REALITY_PUBLIC_KEY="$(egress_env_value EGRESS_REALITY_PUBLIC_KEY || true)"
+    EGRESS_REALITY_SHORT_ID="$(egress_env_value EGRESS_REALITY_SHORT_ID || true)"
+}
+
+validate_egress_values() {
+    case "$EGRESS_MODE" in
+        direct) return 0 ;;
+        vless-reality) ;;
+        *)
+            say_red "BAD_EGRESS_MODE"
+            return 1
+            ;;
+    esac
+
+    [[ "$EGRESS_SERVER" =~ ^[A-Za-z0-9.-]+$ ]] \
+        || { say_red "BAD_EGRESS_SERVER"; return 1; }
+    [[ "$EGRESS_PORT" =~ ^[0-9]+$ ]] \
+        && [ "$EGRESS_PORT" -ge 1 ] \
+        && [ "$EGRESS_PORT" -le 65535 ] \
+        || { say_red "BAD_EGRESS_PORT"; return 1; }
+    [[ "$EGRESS_UUID" =~ ^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$ ]] \
+        || { say_red "BAD_EGRESS_UUID"; return 1; }
+    [[ "$EGRESS_SERVER_NAME" =~ ^[A-Za-z0-9.-]+$ ]] \
+        || { say_red "BAD_EGRESS_SERVER_NAME"; return 1; }
+    [[ "$EGRESS_REALITY_PUBLIC_KEY" =~ ^[A-Za-z0-9_-]{20,128}$ ]] \
+        || { say_red "BAD_EGRESS_REALITY_PUBLIC_KEY"; return 1; }
+    [[ "$EGRESS_REALITY_SHORT_ID" =~ ^[a-fA-F0-9]{1,32}$ ]] \
+        || { say_red "BAD_EGRESS_REALITY_SHORT_ID"; return 1; }
+}
+
+validate_egress_config() {
+    load_egress_config
+    validate_egress_values || return 1
+}
+
+egress_enabled() {
+    load_egress_config
+    [ "$EGRESS_MODE" = "vless-reality" ]
+}
+
+configure_egress() {
+    local current_mode current_server current_port current_uuid
+    local current_server_name current_public_key current_short_id
+    local enabled entered temp_file
+
+    create_dirs
+    load_egress_config
+    current_mode="$EGRESS_MODE"
+    current_server="$EGRESS_SERVER"
+    current_port="$EGRESS_PORT"
+    current_uuid="$EGRESS_UUID"
+    current_server_name="$EGRESS_SERVER_NAME"
+    current_public_key="$EGRESS_REALITY_PUBLIC_KEY"
+    current_short_id="$EGRESS_REALITY_SHORT_ID"
+
+    EGRESS_MODE="${POLMIRA_EGRESS_MODE:-$current_mode}"
+    EGRESS_SERVER="${POLMIRA_EGRESS_SERVER:-$current_server}"
+    EGRESS_PORT="${POLMIRA_EGRESS_PORT:-$current_port}"
+    EGRESS_UUID="${POLMIRA_EGRESS_UUID:-$current_uuid}"
+    EGRESS_SERVER_NAME="${POLMIRA_EGRESS_SERVER_NAME:-$current_server_name}"
+    EGRESS_REALITY_PUBLIC_KEY="${POLMIRA_EGRESS_REALITY_PUBLIC_KEY:-$current_public_key}"
+    EGRESS_REALITY_SHORT_ID="${POLMIRA_EGRESS_REALITY_SHORT_ID:-$current_short_id}"
+
+    if [ -t 0 ]; then
+        enabled="no"
+        [ "$EGRESS_MODE" = "vless-reality" ] && enabled="yes"
+        read -r -p "Российский VLESS Reality для MAX-контейнеров? [yes/no] (${enabled}): " entered
+        enabled="${entered:-$enabled}"
+        case "$enabled" in
+            yes) EGRESS_MODE="vless-reality" ;;
+            no) EGRESS_MODE="direct" ;;
+            *)
+                say_red "Нужно yes или no"
+                return 1
+                ;;
+        esac
+    fi
+
+    if [ "$EGRESS_MODE" = "direct" ]; then
+        temp_file="${EGRESS_ENV_FILE}.tmp.$$"
+        umask 077
+        printf 'EGRESS_MODE=direct\n' > "$temp_file"
+        mv -f "$temp_file" "$EGRESS_ENV_FILE"
+        say_green "MAX-контейнеры будут выходить напрямую"
+        return 0
+    fi
+
+    if [ -t 0 ]; then
+        read -r -p "VLESS сервер (${EGRESS_SERVER:-не задан}): " entered
+        EGRESS_SERVER="${entered:-$EGRESS_SERVER}"
+        read -r -p "VLESS порт (${EGRESS_PORT:-443}): " entered
+        EGRESS_PORT="${entered:-${EGRESS_PORT:-443}}"
+        read -r -s -p "VLESS UUID (Enter сохраняет текущий): " entered
+        echo
+        EGRESS_UUID="${entered:-$EGRESS_UUID}"
+        read -r -p "Reality server name / SNI (${EGRESS_SERVER_NAME:-не задан}): " entered
+        EGRESS_SERVER_NAME="${entered:-$EGRESS_SERVER_NAME}"
+        read -r -p "Reality public key (${EGRESS_REALITY_PUBLIC_KEY:-не задан}): " entered
+        EGRESS_REALITY_PUBLIC_KEY="${entered:-$EGRESS_REALITY_PUBLIC_KEY}"
+        read -r -p "Reality short ID (${EGRESS_REALITY_SHORT_ID:-не задан}): " entered
+        EGRESS_REALITY_SHORT_ID="${entered:-$EGRESS_REALITY_SHORT_ID}"
+    fi
+
+    validate_egress_values || return 1
+    temp_file="${EGRESS_ENV_FILE}.tmp.$$"
+    umask 077
+    {
+        echo "EGRESS_MODE=$EGRESS_MODE"
+        echo "EGRESS_SERVER=$EGRESS_SERVER"
+        echo "EGRESS_PORT=$EGRESS_PORT"
+        echo "EGRESS_UUID=$EGRESS_UUID"
+        echo "EGRESS_SERVER_NAME=$EGRESS_SERVER_NAME"
+        echo "EGRESS_REALITY_PUBLIC_KEY=$EGRESS_REALITY_PUBLIC_KEY"
+        echo "EGRESS_REALITY_SHORT_ID=$EGRESS_REALITY_SHORT_ID"
+    } > "$temp_file"
+    mv -f "$temp_file" "$EGRESS_ENV_FILE"
+    say_green "VLESS Reality сохранён в $EGRESS_ENV_FILE"
+}
+
+instance_network_name() {
+    local tg_id="$1"
+    echo "polmira-net-${tg_id}"
+}
+
+egress_container_name() {
+    local tg_id="$1"
+    echo "polmira-egress-${tg_id}"
+}
+
+ensure_instance_network() {
+    local tg_id="$1"
+    local network_name
+
+    network_name="$(instance_network_name "$tg_id")"
+    if ! docker_cmd network inspect "$network_name" >/dev/null 2>&1; then
+        docker_cmd network create \
+            --driver bridge \
+            --label "polmira.owner=${tg_id}" \
+            "$network_name" >/dev/null
+    fi
+    docker_cmd network inspect -f '{{(index .IPAM.Config 0).Gateway}}' "$network_name"
+}
+
+remove_instance_network() {
+    local tg_id="$1"
+    local network_name
+
+    network_name="$(instance_network_name "$tg_id")"
+    docker_cmd network rm "$network_name" >/dev/null 2>&1 || true
+}
+
+ensure_egress_image() {
+    egress_enabled || return 0
+    docker_cmd image inspect "$SING_BOX_IMAGE" >/dev/null 2>&1 \
+        || docker_cmd pull "$SING_BOX_IMAGE"
+}
+
+write_instance_egress_config() {
+    local instance_dir="$1"
+    local gateway="$2"
+    local config_dir config_file
+
+    validate_egress_config || return 1
+    config_dir="$instance_dir/egress"
+    config_file="$config_dir/sing-box.json"
+    mkdir -p "$config_dir"
+    chmod 700 "$config_dir"
+
+    cat > "$config_file" <<EOF
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "https",
+        "tag": "remote-dns",
+        "server": "1.1.1.1",
+        "server_port": 443,
+        "path": "/dns-query",
+        "tls": {
+          "enabled": true,
+          "server_name": "cloudflare-dns.com"
+        },
+        "detour": "ru-vless"
+      }
+    ],
+    "final": "remote-dns",
+    "strategy": "ipv4_only"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "tun0",
+      "address": ["172.30.0.1/30"],
+      "mtu": 1400,
+      "auto_route": true,
+      "auto_redirect": true,
+      "strict_route": true,
+      "route_exclude_address": ["${gateway}/32"]
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "ru-vless",
+      "server": "${EGRESS_SERVER}",
+      "server_port": ${EGRESS_PORT},
+      "uuid": "${EGRESS_UUID}",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "server_name": "${EGRESS_SERVER_NAME}",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "${EGRESS_REALITY_PUBLIC_KEY}",
+          "short_id": "${EGRESS_REALITY_SHORT_ID}"
+        }
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "rules": [
+      {
+        "port": 53,
+        "action": "hijack-dns"
+      },
+      {
+        "ip_cidr": ["${gateway}/32"],
+        "action": "route",
+        "outbound": "direct"
+      }
+    ],
+    "final": "ru-vless"
+  }
+}
+EOF
+    chmod 600 "$config_file"
+    echo "$config_file"
+}
+
+wait_for_ru_egress() {
+    local container="$1"
+    local pid payload country
+
+    for _ in $(seq 1 15); do
+        pid="$(docker_cmd inspect -f '{{.State.Pid}}' "$container" 2>/dev/null || echo 0)"
+        if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+            payload="$(nsenter -t "$pid" -n curl -4fsS --max-time 10 \
+                https://api.country.is/ 2>/dev/null || true)"
+            if echo "$payload" | grep -Eq '"country"[[:space:]]*:[[:space:]]*"RU"'; then
+                country="RU"
+            else
+                country="$(nsenter -t "$pid" -n curl -4fsS --max-time 10 \
+                    https://ifconfig.co/country-iso 2>/dev/null \
+                    | tr -d '[:space:]' || true)"
+            fi
+            if [ "$country" = "RU" ]; then
+                return 0
+            fi
+        fi
+        sleep 2
+    done
+
+    say_red "RU_EGRESS_CHECK_FAILED"
+    docker_cmd logs --tail 80 "$container" >&2 || true
+    return 1
 }
 
 public_base_url() {
@@ -678,6 +980,7 @@ write_authelia_users() {
     local users_file="$AUTHELIA_DIR/users_database.yml"
     local tmp_file="${users_file}.tmp"
     local env_file instance_dir username password_hash
+    local wrote_user="no"
 
     {
         echo "users:"
@@ -687,6 +990,7 @@ write_authelia_users() {
             [ -n "$username" ] || continue
             [ -f "$instance_dir/authelia-password.hash" ] || continue
             password_hash="$(cat "$instance_dir/authelia-password.hash")"
+            wrote_user="yes"
 
             cat <<EOF
   "${username}":
@@ -698,6 +1002,16 @@ write_authelia_users() {
       - "maxofon"
 EOF
         done < <(find "$INSTANCES_DIR" -mindepth 2 -maxdepth 2 -name instance.env 2>/dev/null | sort)
+        if [ "$wrote_user" = "no" ]; then
+            cat <<'EOF'
+  "_bootstrap":
+    disabled: true
+    displayname: "Bootstrap"
+    password: "$argon2id$v=19$m=65536,t=3,p=4$+4WyYW6kjHILKjHZnHV58A$UUyydfaPOCYdXY4tPyBN1TdQ+pPaDsDIPagX72PRLLw"
+    email: "bootstrap@polmira.invalid"
+    groups: []
+EOF
+        fi
     } > "$tmp_file"
 
     mv "$tmp_file" "$users_file"
@@ -779,6 +1093,10 @@ regulation:
 access_control:
   default_policy: "deny"
   rules:
+    - domain: "${PUBLIC_HOST}"
+      resources:
+        - "^/$"
+      policy: "deny"
 EOF
 
     while IFS= read -r env_file; do
@@ -956,8 +1274,7 @@ server {
 EOF
     fi
 
-    rm -f "$NGINX_ROOT/sites-enabled/default" \
-        "$NGINX_ROOT/sites-enabled/polmira" \
+    rm -f "$NGINX_ROOT/sites-enabled/polmira" \
         "$NGINX_ROOT/sites-enabled/polmira-docker" \
         "$NGINX_ROOT/sites-enabled/polmira-linux" 2>/dev/null || true
     ln -sf "$NGINX_SITE" "$NGINX_SITE_LINK"
@@ -1032,6 +1349,38 @@ location = ${WEB_PATH}push/subscribe {
     proxy_pass http://172.17.0.1:8788/push/subscribe;
 }
 
+location = ${WEB_PATH}relay/notify {
+    if (\$http_x_polmira_tg_id != "${TG_ID}") { return 403; }
+    if (\$http_x_polmira_secret != "${RELAY_SECRET}") { return 403; }
+    client_max_body_size 1m;
+
+    proxy_http_version 1.1;
+    proxy_set_header X-Polmira-Tg-Id \$http_x_polmira_tg_id;
+    proxy_set_header X-Polmira-Secret \$http_x_polmira_secret;
+    proxy_set_header Content-Type \$content_type;
+    proxy_read_timeout 30s;
+
+    proxy_pass http://172.17.0.1:8788/notify;
+}
+
+location = ${WEB_PATH}relay/file {
+    if (\$http_x_polmira_tg_id != "${TG_ID}") { return 403; }
+    if (\$http_x_polmira_secret != "${RELAY_SECRET}") { return 403; }
+    client_max_body_size 49m;
+
+    proxy_http_version 1.1;
+    proxy_request_buffering off;
+    proxy_set_header X-Polmira-Tg-Id \$http_x_polmira_tg_id;
+    proxy_set_header X-Polmira-Secret \$http_x_polmira_secret;
+    proxy_set_header X-Polmira-Filename \$http_x_polmira_filename;
+    proxy_set_header X-Polmira-Caption \$http_x_polmira_caption;
+    proxy_set_header Content-Type \$content_type;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+
+    proxy_pass http://172.17.0.1:8788/file;
+}
+
 location ${WEB_PATH} {
     auth_request /internal/authelia/authz;
     auth_request_set \$redirection_url \$upstream_http_location;
@@ -1063,6 +1412,7 @@ location ${WEB_PATH} {
     proxy_pass http://127.0.0.1:${WEB_PORT};
 }
 EOF
+    chmod 600 "${NGINX_SNIPPETS_DIR}/${INSTANCE_NAME}.conf"
 
     nginx_cmd -t
     systemctl reload nginx
@@ -1125,6 +1475,7 @@ ensure_images() {
         build_images_from_source
     fi
     ensure_authelia_image
+    ensure_egress_image
 }
 
 pull_images() {
@@ -1133,6 +1484,9 @@ pull_images() {
     docker_cmd pull "$MAX_IMAGE" || pulled_all="no"
     docker_cmd pull "$BOT_IMAGE" || pulled_all="no"
     docker_cmd pull "$AUTHELIA_IMAGE"
+    if egress_enabled; then
+        docker_cmd pull "$SING_BOX_IMAGE"
+    fi
     if [ "$pulled_all" != "yes" ]; then
         build_images_from_source yes
     fi
@@ -1184,10 +1538,13 @@ prepare_profile_layout() {
 
 start_container() {
     local instance_dir="$1"
-    local bot_token relay_secret render_node
+    local relay_secret render_node network_name gateway
+    local egress_container egress_config relay_url
     local wayland_enabled="false"
     local -a gpu_args=()
     local -a gpu_env=()
+    local -a network_args=()
+    local -a publish_args=()
     load_instance_env "$instance_dir" || return 1
 
     ensure_images
@@ -1196,14 +1553,53 @@ start_container() {
         echo "RELAY_SECRET=$RELAY_SECRET" >> "$instance_dir/instance.env"
     fi
 
-    bot_token="$(load_bot_env_value TELEGRAM_BOT_TOKEN || true)"
     relay_secret="$RELAY_SECRET"
+    network_name="$(instance_network_name "$TG_ID")"
+    egress_container="$(egress_container_name "$TG_ID")"
 
     if container_exists "$CONTAINER_NAME"; then
         docker_cmd rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
     fi
+    if container_exists "$egress_container"; then
+        docker_cmd rm -f "$egress_container" >/dev/null 2>&1 || true
+    fi
     prepare_profile_layout "$instance_dir"
     chmod 755 "$instance_dir" "$instance_dir/selkies-home" "$instance_dir/selkies-home/Downloads"
+    gateway="$(ensure_instance_network "$TG_ID")"
+    relay_url="$(public_base_url)${WEB_PATH}relay/notify"
+
+    if egress_enabled; then
+        egress_config="$(write_instance_egress_config "$instance_dir" "$gateway")"
+        docker_cmd run --rm \
+            -v "${egress_config}:/etc/sing-box/config.json:ro" \
+            "$SING_BOX_IMAGE" \
+            check -c /etc/sing-box/config.json
+        docker_cmd run -d \
+            --name "$egress_container" \
+            --restart unless-stopped \
+            --network "$network_name" \
+            --cpus 0.20 \
+            --memory 128m \
+            --cap-drop ALL \
+            --cap-add NET_ADMIN \
+            --cap-add NET_RAW \
+            --device /dev/net/tun:/dev/net/tun \
+            --security-opt no-new-privileges=true \
+            --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+            -p "127.0.0.1:${WEB_PORT}:3000" \
+            -v "${egress_config}:/etc/sing-box/config.json:ro" \
+            "$SING_BOX_IMAGE" \
+            run -c /etc/sing-box/config.json >/dev/null
+        if ! wait_for_ru_egress "$egress_container"; then
+            docker_cmd rm -f "$egress_container" >/dev/null 2>&1 || true
+            return 1
+        fi
+        network_args=(--network "container:${egress_container}")
+    else
+        rm -rf "$instance_dir/egress"
+        network_args=(--network "$network_name")
+        publish_args=(-p "127.0.0.1:${WEB_PORT}:3000")
+    fi
 
     if grep -qw avx2 /proc/cpuinfo 2>/dev/null \
         && nvidia_selkies_available; then
@@ -1220,16 +1616,17 @@ start_container() {
         gpu_args=(--device /dev/dri:/dev/dri)
     fi
 
-    docker_cmd run -d \
+    if ! docker_cmd run -d \
         --name "$CONTAINER_NAME" \
         --restart unless-stopped \
         --cpus "$MAX_CPUS" \
         --memory "$MAX_MEMORY" \
         --shm-size 1g \
         --security-opt no-new-privileges=true \
+        "${network_args[@]}" \
+        "${publish_args[@]}" \
         "${gpu_args[@]}" \
         "${gpu_env[@]}" \
-        -p "127.0.0.1:${WEB_PORT}:3000" \
         -e "PUID=1000" \
         -e "PGID=1000" \
         -e "TZ=Europe/Moscow" \
@@ -1245,6 +1642,7 @@ start_container() {
         -e "SELKIES_MICROPHONE_ENABLED=false" \
         -e "SELKIES_GAMEPAD_ENABLED=false" \
         -e "SELKIES_SECOND_SCREEN=false" \
+        -e "MAX_RES=1280x2400" \
         -e "SELKIES_MANUAL_WIDTH=1280" \
         -e "SELKIES_MANUAL_HEIGHT=720" \
         -e "SELKIES_SCALING_DPI=96" \
@@ -1272,13 +1670,17 @@ start_container() {
         -e "NO_DECOR=true" \
         -e "RESTART_APP=true" \
         -e "TG_ID=${TG_ID}" \
-        -e "TELEGRAM_BOT_TOKEN=${bot_token}" \
-        -e "POLMIRA_RELAY_URL=http://172.17.0.1:8788/notify" \
+        -e "POLMIRA_RELAY_URL=${relay_url}" \
         -e "POLMIRA_RELAY_SECRET=${relay_secret}" \
         -e "POLMIRA_USER_HOME=/config" \
         -e "POLMIRA_WATCH_INTERNAL_FILES=no" \
         -v "${instance_dir}/selkies-home:/config" \
-        "$MAX_IMAGE" >/dev/null
+        "$MAX_IMAGE" >/dev/null; then
+        if egress_enabled; then
+            docker_cmd rm -f "$egress_container" >/dev/null 2>&1 || true
+        fi
+        return 1
+    fi
 }
 
 container_status() {
@@ -1297,19 +1699,26 @@ web_ready() {
 
 instance_info_by_dir() {
     local instance_dir="$1"
-    local status ready downloads_dir
+    local status ready downloads_dir vpn_enabled egress_status
     load_instance_env "$instance_dir" || return 1
 
     status="$(container_status "$CONTAINER_NAME")"
     ready="$(web_ready "$WEB_PORT")"
     downloads_dir="${DOWNLOADS_DIR:-$instance_dir/selkies-home/Downloads}"
+    vpn_enabled="no"
+    egress_status="direct"
+    if egress_enabled; then
+        vpn_enabled="yes"
+        egress_status="$(container_status "$(egress_container_name "$TG_ID")")"
+    fi
 
     echo "INSTANCE_NAME=$INSTANCE_NAME"
     echo "CONTAINER_NAME=$CONTAINER_NAME"
     echo "TG_ID=$TG_ID"
     echo "USERNAME=$USERNAME"
     echo "URL=$(instance_url "$WEB_PATH")"
-    echo "VPN_ENABLED=no"
+    echo "VPN_ENABLED=$vpn_enabled"
+    echo "EGRESS_STATUS=$egress_status"
     echo "INIT_STATUS=$status"
     echo "WEB_STATUS=$status"
     echo "WEB_READY=$ready"
@@ -1432,10 +1841,12 @@ bot_stop_instance() {
     need_root
     create_dirs
 
-    local instance_dir
+    local instance_dir egress_container
     instance_dir="$(instance_dir_or_fail "${1:-}")" || return 1
     load_instance_env "$instance_dir" || return 1
+    egress_container="$(egress_container_name "$TG_ID")"
     docker_cmd stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    docker_cmd stop "$egress_container" >/dev/null 2>&1 || true
     instance_info_by_dir "$instance_dir"
 }
 
@@ -1443,7 +1854,7 @@ bot_delete_instance() {
     need_root
     create_dirs
 
-    local tg_id instance_dir instance_name resolved_dir
+    local tg_id instance_dir instance_name resolved_dir egress_container
     tg_id="${1:-}"
     instance_dir="$(instance_dir_or_fail "$tg_id")" || return 1
     validate_instance_dir_for_tg_id "$tg_id" "$instance_dir" || return 1
@@ -1451,9 +1862,12 @@ bot_delete_instance() {
 
     load_instance_env "$instance_dir" || return 1
     instance_name="$INSTANCE_NAME"
+    egress_container="$(egress_container_name "$TG_ID")"
 
     delete_audit "start tg_id=$tg_id instance=$instance_name container=$CONTAINER_NAME dir=$resolved_dir"
     docker_cmd rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    docker_cmd rm -f "$egress_container" >/dev/null 2>&1 || true
+    remove_instance_network "$TG_ID"
     remove_instance_nginx_conf "$instance_name" || true
     rm -rf "$instance_dir"
     remove_owner_state "$tg_id"
@@ -1712,9 +2126,11 @@ interactive_menu() {
 
     while true; do
         clear || true
+        load_egress_config
         echo "Polmira MAX Docker"
         echo "=================="
         echo "Домен: ${PUBLIC_HOST:-не задан}"
+        echo "Сеть MAX: ${EGRESS_MODE}"
         echo
         list_instances
         echo
@@ -1730,6 +2146,7 @@ interactive_menu() {
         echo "10) Запретить Telegram ID"
         echo "11) Список разрешённых Telegram ID"
         echo "12) Повторно настроить домен и бота"
+        echo "13) Настроить российский VLESS для MAX"
         echo "0) Выход"
         echo
 
@@ -1790,6 +2207,9 @@ interactive_menu() {
             12)
                 install_polmira
                 ;;
+            13)
+                configure_egress
+                ;;
             0)
                 exit 0
                 ;;
@@ -1810,6 +2230,11 @@ install_polmira() {
     create_dirs
     configure_public_access
     configure_bot
+    if [ ! -f "$EGRESS_ENV_FILE" ]; then
+        configure_egress
+    else
+        validate_egress_config
+    fi
     if [ ! -s "$TG_ALLOWED_FILE" ]; then
         local admin_tg_id
         admin_tg_id="$(prompt_value "Telegram ID администратора")"
@@ -1843,6 +2268,7 @@ cli_dispatch() {
         allowed) shift; list_allowed_ids "$@" ;;
         list) shift; list_instances "$@" ;;
         refresh-nginx) shift; refresh_nginx "$@" ;;
+        configure-egress) shift; need_root; configure_egress "$@" ;;
         recreate-all) shift; recreate_all_instances "$@" ;;
         update) shift; update_polmira "$@" ;;
         menu) shift; interactive_menu ;;
@@ -1884,6 +2310,7 @@ main() {
   polmira allowed
   polmira list
   polmira refresh-nginx
+  polmira configure-egress
   polmira menu
 EOF
     return 1

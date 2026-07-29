@@ -94,7 +94,7 @@ def render_max_message(summary, body):
 
 
 def send_telegram(text):
-    if not BOT_TOKEN or not TG_ID or not text.strip():
+    if not TG_ID or not text.strip():
         return
 
     if POLMIRA_RELAY_URL:
@@ -106,10 +106,17 @@ def send_telegram(text):
         request = urllib.request.Request(
             POLMIRA_RELAY_URL,
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "X-Polmira-Tg-Id": TG_ID,
+                "X-Polmira-Secret": POLMIRA_RELAY_SECRET,
+            },
         )
         with urllib.request.urlopen(request, timeout=10) as response:
             response.read()
+        return
+
+    if not BOT_TOKEN:
         return
 
     payload = json.dumps({

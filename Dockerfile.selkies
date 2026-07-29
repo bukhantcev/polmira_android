@@ -50,6 +50,7 @@ COPY max-container/icon.png /usr/share/selkies/www/icon.png
 
 RUN python3 /tmp/patch-selkies-single-session.py \
     && rm /tmp/patch-selkies-single-session.py \
+    && python3 -c 'from pathlib import Path; p = Path("/etc/s6-overlay/s6-rc.d/svc-xorg/run"); s = p.read_text(); old = "if [ -n \"${SELKIES_MANUAL_HEIGHT}\" ] || [ -n \"${SELKIES_MANUAL_WIDTH}\" ]; then"; new = "if [ -z \"${MAX_RES+x}\" ] && { [ -n \"${SELKIES_MANUAL_HEIGHT}\" ] || [ -n \"${SELKIES_MANUAL_WIDTH}\" ]; }; then"; assert s.count(old) == 1; p.write_text(s.replace(old, new, 1))' \
     && printf '%s\n' '/usr/local/bin/polmira-selkies-session' > /defaults/autostart \
     && printf '%s\n' '/usr/local/bin/polmira-selkies-session' > /defaults/autostart_wayland \
     && chmod +x \
